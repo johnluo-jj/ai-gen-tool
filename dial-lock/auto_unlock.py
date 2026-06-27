@@ -493,15 +493,70 @@ def calibrate():
     print("建议先用 --debug 跑一遍看识别准不准：python auto_unlock.py --debug")
 
 
+# ----------------------------- 一次性诊断快照 -----------------------------
+def snapshot(cfg):
+    """抓一帧，把『原始ROI / 环带叠加 / 显著度热图』存盘，并打印各阈值下切出的段宽。
+    用于真机识别为空(nSec=0/ptr=-)时定位：环带没对准？阈值太高？没抓到表盘？"""
+    ctx = make_context(cfg)
+    g = Grabber()
+    for s in range(5, 0, -1):
+        print(f"\r  {s} 秒后抓取一帧诊断(把游戏切到前台、露出表盘) ...", end="")
+        time.sleep(1)
+    print()
+    frame = g.grab(ctx["region"])
+    mean = float(frame.mean())
+    warn = "  ⚠ 接近全黑：游戏多半是『独占全屏』，mss 截不到，请切『窗口化/无边框』" if mean < 8 else ""
+    print(f"ROI={ctx['region']}  画面均值={mean:.1f}{warn}")
+    cx, cy = cfg["center"]
+    tr = ctx["track_bool"]
+    print(f"center=({cx},{cy}) r_inner={cfg['r_inner']} r_outer={cfg['r_outer']}  环带像素数={int(tr.sum())}")
+
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2Lab)
+    L = lab[:, :, 0].astype(np.float32); A = lab[:, :, 1].astype(np.float32); Bc = lab[:, :, 2].astype(np.float32)
+    sal_img = np.zeros(frame.shape[:2], np.float32)
+    if tr.any():
+        Lt, At, Bt = L[tr], A[tr], Bc[tr]
+        sal = np.maximum(0.0, Lt - np.median(Lt)) + np.sqrt((At - np.median(At)) ** 2 + (Bt - np.median(Bt)) ** 2)
+        sal_img[tr] = sal
+        print(f"环带显著度: max={sal.max():.0f}  p99={np.percentile(sal,99):.0f}  中位={np.median(sal):.0f}")
+        print("各 arc_salience 阈值下、环带里能切出的段宽(度)：")
+        for thr in (6, 10, 14, 18, 22, 30):
+            m = sal >= thr
+            if m.any():
+                cnt = np.bincount(ctx["angle_int"][tr][m], minlength=360)
+                ws = sorted([l for _, l in circular_runs(cnt >= cfg["bar_min_px"])], reverse=True)
+            else:
+                ws = []
+            print(f"  arc_salience={thr:>2}: 段数={len(ws):>2} 段宽={ws}")
+    else:
+        print("⚠ 环带像素数=0：标定的 center/r_inner/r_outer 不对(环带落到画面外或半径退化)，请重新 --calibrate。")
+
+    l, t = ctx["region"]["left"], ctx["region"]["top"]
+    cxl, cyl = int(cx - l), int(cy - t)
+    base = os.path.join(os.path.dirname(CONFIG_PATH), "_snap")
+    cv2.imwrite(base + "_roi.png", frame)                         # 原始抓取
+    ov = frame.copy()
+    cv2.circle(ov, (cxl, cyl), int(cfg["r_inner"]), (0, 255, 0), 1)
+    cv2.circle(ov, (cxl, cyl), int(cfg["r_outer"]), (0, 255, 0), 1)
+    cv2.imwrite(base + "_band.png", ov)                           # 环带是否压在黄蓝条上
+    mx = max(1.0, float(sal_img.max()))
+    heat = cv2.applyColorMap(np.clip(sal_img / mx * 255, 0, 255).astype(np.uint8), cv2.COLORMAP_JET)
+    cv2.imwrite(base + "_sal.png", heat)                          # 显著度热图(亮=被判为有东西)
+    print(f"已存盘：{base}_roi.png / {base}_band.png / {base}_sal.png —— 把这三张发我。")
+
+
 # ----------------------------- 入口 -----------------------------
 def main():
     ap = argparse.ArgumentParser(description="轮盘撬锁 自动辅助")
     ap.add_argument("--calibrate", action="store_true", help="标定表盘圆环几何(只点环)")
     ap.add_argument("--debug", action="store_true", help="运行时显示识别画面")
+    ap.add_argument("--snapshot", action="store_true", help="抓一帧存诊断图(识别为空时定位问题)")
     args = ap.parse_args()
 
     if args.calibrate:
         calibrate()
+    elif args.snapshot:
+        snapshot(load_config())
     else:
         run(load_config(), debug=args.debug)
 
