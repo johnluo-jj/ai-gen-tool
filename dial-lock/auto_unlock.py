@@ -134,7 +134,9 @@ class Grabber:
 def make_context(cfg):
     cx, cy = cfg["center"]
     r_in, r_out = cfg["r_inner"], cfg["r_outer"]
-    depth = max(1, r_out - r_in)
+    if r_in > r_out:                          # 防御：标定内外环写反时自动对调(否则环带为空集)
+        print(f"⚠ 标定异常：r_inner({r_in}) > r_outer({r_out})，已自动对调；建议重新 --calibrate。")
+        r_in, r_out = r_out, r_in
     margin = 8
     left = int(cx - r_out - margin)
     top = int(cy - r_out - margin)
@@ -234,6 +236,12 @@ def run(cfg, debug=False):
 
     ctx = make_context(cfg)
     g = Grabber()
+
+    band_px = int(ctx["track_bool"].sum())     # 启动自检日志：环带是否有效
+    print(f"环带几何: center={cfg['center']} r_inner={cfg['r_inner']} r_outer={cfg['r_outer']} "
+          f"环带像素数={band_px} ROI={ctx['region']['width']}x{ctx['region']['height']}")
+    if band_px == 0:
+        print("⚠ 环带像素数=0：标定的圆环几何无效，detect 必然识别为空。请重新 --calibrate 或先跑 --snapshot。")
 
     click_pos = cfg["click_pos"]   # None=原地点击(光标由你自己停在不影响区，bot 不动鼠标)
 
@@ -341,7 +349,7 @@ def draw_debug(frame, ctx, pointer, sectors, boosting, should_click):
     # 注意：指针压到扇形上时多半会并入扇形(pointer=None)——那一刻正是命中，
     # 所以按 should_click 上色(它已处理"pointer=None+有扇形=命中")，而不是看指针是否还独立可见。
     for s in sectors:
-        color = (0, 0, 255) if should_click else (0, 220, 220)
+        color = (0, 200, 0) if should_click else (0, 220, 220)    # 命中=绿(避开游戏里"点错=红")，否则黄
         a0, a1 = s["center"] - s["len"] / 2.0, s["center"] + s["len"] / 2.0
         cv2.ellipse(img, (cxl, cyl), (R, R), 0, a0, a1, color, 3)
     if pointer is not None:           # 指针(细线)；并入扇形时无独立指针，不画线
@@ -353,8 +361,8 @@ def draw_debug(frame, ctx, pointer, sectors, boosting, should_click):
     ptxt = "merged/None" if pointer is None else f"{pointer:.0f}"
     cv2.putText(img, f"ptr={ptxt}  nSec={len(sectors)}  boost={'on' if boosting else 'off'}",
                 (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1, cv2.LINE_AA)
-    if should_click:                  # 真实点击决策：命中即大字提示
-        cv2.putText(img, "CLICK", (8, 54), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2, cv2.LINE_AA)
+    if should_click:                  # 真实点击决策：命中即大字提示(绿，别和游戏"点错=红"混淆)
+        cv2.putText(img, "CLICK", (8, 54), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 200, 0), 2, cv2.LINE_AA)
     diag = ctx.get("diag", {})        # 诊断值叠到画面底部，方便直接截图给我看
     if diag:
         h = img.shape[0]
@@ -381,17 +389,17 @@ def calibrate():
                   "请改成『窗口化 / 无边框窗口』模式，再在标定窗口里按 r 重抓。")
         return f
 
-    print("标定：先把游戏切到前台，露出表盘(画面里有没有弧条都行，本步只标圆环几何)。")
+    print("标定：先把游戏切到前台，露出表盘。⚠ 要标的是【黄蓝条所在的那一圈环带】，不是表盘最外的装饰大环。")
     frame = grab_check(3)
 
     H, W = frame.shape[:2]
     scale = min(1.0, 0.92 * mon["height"] / H, 0.92 * mon["width"] / W)   # 放大到接近全屏，刻度更大
     disp_w, disp_h = int(W * scale), int(H * scale)
 
-    # 只标几何：外/内环各多点拟合圆(抹平点击误差)。颜色不再标定(运行时 Lab 自适应判别)
+    # 只标几何：黄蓝条环带的外/内边缘各多点拟合圆(抹平点击误差)。颜色不再标定(运行时 Lab 自适应判别)
     steps = [
-        {"key": "outer", "tip": "沿[外环]边缘点 4~6 个点，按 n 下一步"},
-        {"key": "inner", "tip": "沿[内环]边缘点 4~6 个点，按 n 下一步"},
+        {"key": "outer", "tip": "沿[黄蓝条外侧]边缘点 4~6 个点，按 n 下一步"},
+        {"key": "inner", "tip": "沿[黄蓝条内侧]边缘点 4~6 个点，按 n 下一步"},
     ]
     picks = {}
     idx = [0]
@@ -420,7 +428,7 @@ def calibrate():
 
     open_win()
     print("标定窗口已弹出并置顶；若仍被游戏挡住，Alt+Tab 切到 'calibrate' 窗口。画面是冻结的，可慢慢点。")
-    print("外环/内环各点 4~6 个点(越多越准)，会实时画出拟合圆；贴住环线后按 n 进入下一步。")
+    print("黄蓝条那圈的外/内边缘各点 4~6 个点(越多越准)，会实时画出拟合圆；贴住边缘后按 n 进入下一步。")
 
     def ring_ok():
         return len(picks.get("outer", [])) >= 3 and len(picks.get("inner", [])) >= 3
@@ -480,7 +488,7 @@ def calibrate():
         return np.hypot(p[:, 0] - cx, p[:, 1] - cy)
 
     ro, ri = radii(picks["outer"]), radii(picks["inner"])
-    r_out, r_in = sorted((ro.mean(), ri.mean()))
+    r_in, r_out = sorted((ro.mean(), ri.mean()))    # 升序：小值=内环，大值=外环(别再写反)
 
     cfg = dict(DEFAULTS)
     cfg["center"] = [int(round(cx)), int(round(cy))]
