@@ -210,10 +210,11 @@ def edge_distance(pointer, sector):
 
 def choose_and_decide(pointer, omega, dt, sectors, cfg):
     """命中即点，不分黄/蓝、不排优先级。返回 (should_click, nearest_edge_dist)。
-    - 指针有独立细段：其(含延迟提前量)落入某扇形角度区间就点；
-    - 指针没切出独立细段：说明已并入某扇形(指针很细、被宽段吞掉)，有扇形即判命中。"""
+    只有【识别到指针 且 指针(含延迟提前量)落入某扇形角度区间】才点。"""
     if pointer is None:
-        return len(sectors) > 0, None
+        # 指针没被识别到：无法区分"并入扇形(命中)"还是"漏检"。漏检时盲点会一直误点(游戏里点错有惩罚)，
+        # 所以保守——没看到指针就不点。等 --debug 确认指针在缝隙里能稳定识别后，再议是否恢复"并入即命中"。
+        return False, None
 
     predicted = pointer + omega * cfg["latency"]
     guard = 0.5 * abs(omega) * dt                # 高速时半帧角位移，避免两帧间跨过窄扇形而漏判
@@ -272,7 +273,7 @@ def run(cfg, debug=False):
             (pydirectinput.mouseDown if on else pydirectinput.mouseUp)(button="right")
             boosting = on
 
-    last_log, frames = 0.0, 0
+    last_log, frames, ptr_frames = 0.0, 0, 0
     try:
         while not state["quit"]:
             now = time.perf_counter()
@@ -290,6 +291,7 @@ def run(cfg, debug=False):
 
             dt = (now - prev_t) if prev_t is not None else 0.016
             if pointer is not None:
+                ptr_frames += 1                             # 指针被识别到的帧数(算识别率)
                 if prev_angle is not None and dt > 0:
                     w = ang_diff(pointer, prev_angle) / dt
                     omega = 0.5 * w + 0.5 * omega           # 轻度平滑，反向时也能较快跟上
@@ -314,10 +316,12 @@ def run(cfg, debug=False):
                 clicks += 1
 
             if now - last_log > 1.0:
-                fps = frames / (now - last_log)
-                last_log, frames = now, 0
+                nf = frames
+                fps = nf / (now - last_log)
+                seen = f"{100 * ptr_frames / max(1, nf):3.0f}%"   # 指针识别率：低=指针经常没认到(就会乱点/不点)
+                last_log, frames, ptr_frames = now, 0, 0
                 msg = (f"\rfps={fps:4.0f} ptr={'-' if pointer is None else f'{pointer:6.1f}'} "
-                       f"w={omega:7.1f}/s nSec={len(sectors)} hit={'Y' if should_click else 'n'} "
+                       f"ptrSeen={seen} w={omega:7.1f}/s nSec={len(sectors)} hit={'Y' if should_click else 'n'} "
                        f"clicks={clicks} boost={'Y' if boosting else 'n'}")
                 if debug:
                     msg += "  " + " ".join(f"{k}={v}" for k, v in ctx.get("diag", {}).items())
