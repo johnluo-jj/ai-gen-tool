@@ -357,9 +357,20 @@ def draw_debug(frame, ctx, pointer, score, bonus, boosting):
 def calibrate():
     g = Grabber()
     mon = g.primary()
-    print("标定：3 秒后抓取主屏画面，请先把游戏切到前台、并让画面里出现蓝指针+黄/蓝弧条 ...")
-    time.sleep(3)
-    frame = g.grab(mon)
+
+    def grab_check(wait):
+        for s in range(wait, 0, -1):
+            print(f"\r  {s} 秒后抓取主屏画面 ...   ", end="")
+            time.sleep(1)
+        print()
+        f = g.grab(mon)
+        if float(f.mean()) < 8.0:
+            print("⚠ 抓到的画面接近全黑：游戏很可能是『独占全屏』(mss 截不到)。"
+                  "请改成『窗口化 / 无边框窗口』模式，再在标定窗口里按 r 重抓。")
+        return f
+
+    print("标定：先把游戏切到前台，让画面出现蓝指针 + 黄/蓝弧条。")
+    frame = grab_check(3)
 
     H, W = frame.shape[:2]
     scale = min(1.0, 1100.0 / max(W, H))
@@ -394,8 +405,19 @@ def calibrate():
         idx[0] += 1
 
     win = "calibrate (左键依次点击; s 跳过当前; r 重抓; Enter 保存; Esc 取消)"
-    cv2.namedWindow(win)
-    cv2.setMouseCallback(win, on_mouse)
+
+    def open_win():
+        cv2.namedWindow(win)
+        try:
+            cv2.setWindowProperty(win, cv2.WND_PROP_TOPMOST, 1)   # 置顶，避免被游戏挡住
+        except Exception:
+            pass
+        cv2.moveWindow(win, 0, 0)
+        cv2.setMouseCallback(win, on_mouse)
+
+    open_win()
+    print("标定窗口已弹出并置顶；若仍被游戏挡住，Alt+Tab 切到 'calibrate' 窗口。"
+          "画面是冻结的，可以慢慢点。")
 
     while True:
         disp = cv2.resize(frame, (disp_w, disp_h))
@@ -408,12 +430,13 @@ def calibrate():
             print(f"  跳过 {steps[idx[0]][1]}")
             idx[0] += 1
         elif k == ord("r"):
-            print("重抓画面 ...")
-            time.sleep(2)
-            frame = g.grab(mon)
+            cv2.destroyWindow(win)        # 先关掉标定窗口，免得把它自己截进去
+            cv2.waitKey(1)
+            frame = grab_check(2)
             hsv_full = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
             picks.clear()
             idx[0] = 0
+            open_win()
         elif k == 13:    # Enter
             if all(j in picks for j in ("center", "r_out", "r_in")):
                 break
@@ -453,4 +476,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n已中断。")
