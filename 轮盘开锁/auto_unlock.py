@@ -41,23 +41,19 @@ if sys.platform == "win32":
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
-# 颜色默认值(标定跳过时兜底；HSV，H:0-179)。指针与加时条共用 blue。
-DEFAULT_COLORS = {
-    "blue":   [[[92, 90, 120], [125, 255, 255]]],    # 蓝指针
-    "bonus":  [[[92, 90, 120], [125, 255, 255]]],    # 蓝加时条(默认同蓝指针；建议标定单独取色)
-    "yellow": [[[18, 110, 130], [34, 255, 255]]],    # 黄高亮条
-}
-
 DEFAULTS = {
     "latency": 0.05,            # 总延迟(秒)：截屏+处理+系统点击；命中率主要靠它调
     "min_click_interval": 0.16, # 两次点击最小间隔(秒)，防抖
     "fire_base_tol": 2.5,       # 瞄准弧条中心的基础角度容差(度)
-    "pointer_guard_deg": 8,     # 找蓝加时条时排除指针±该角度，避免蓝针被当成加时条
-    "pointer_min_px": 8,        # 指针被认定所需最少像素
+    "arc_salience": 22,         # 弧条阈值：环上像素相对底环的"亮+彩"偏离≥此值算弧条(抗褪色)
+    "cls_b_margin": 8,          # 黄/蓝分类：弧条平均 Lab-b 偏离 >+此值=黄，<-此值=蓝
+    "white_l_min": 200,         # 指针：尖端"发白"像素的最低亮度 L(0-255)
+    "white_chroma_max": 30,     # 指针：尖端像素最大彩度(越小越"白"，借此与彩色弧条区分)
+    "tip_band": 0.35,           # 指针尖端检测带：外圈末尾该比例*环宽
+    "pointer_guard_deg": 8,     # 找弧条时排除指针±该角度，避免指针被当成条
+    "pointer_min_px": 6,        # 指针被认定所需最少像素
     "bar_min_px": 5,            # 某角度上被算作"条"所需最少像素
     "bar_min_arc": 4,           # 弧条最小角宽(度)：放小以便识别"逐渐变细"的条
-    "pointer_band": 0.55,       # 指针检测带：内圈 [r_in, r_in+该比例*环宽]
-    "bar_band": 0.60,           # 弧条检测带：外圈 末尾该比例*环宽
     "click_pos": None,          # 左键点击坐标[x,y]；null=原地点击(不移动光标，光标由你自己停好)
     "boost": {"enabled": True, "release_deg": 22.0},  # 自适应加速：离目标>该角度则按住右键
 }
@@ -110,21 +106,6 @@ def fit_circle(points):
     return float(a), float(b), float(np.sqrt(max(c + a * a + b * b, 0.0)))
 
 
-def build_hsv_box(samples, dh=8, ds=70, dv=80):
-    """由多个 HSV 采样点合成一个 inRange 范围，覆盖"渐变/发光"的元素(如蓝紫→近白的指针)。
-    色相只用较饱和的样本来定(白端 H 是噪声)；放宽 S/V 下限以覆盖偏白部分。
-    samples: [[H,S,V], ...]（H:0-179）。返回 [[lo, hi]]。"""
-    a = np.asarray(samples, dtype=np.float64)
-    H, S, V = a[:, 0], a[:, 1], a[:, 2]
-    sat = S >= 80
-    Hs = H[sat] if sat.any() else H
-    h_lo = max(0, int(Hs.min()) - dh)
-    h_hi = min(179, int(Hs.max()) + dh)
-    s_lo = max(35, int(S.min()) - ds)         # floor 35：别低到匹配纯灰白
-    v_lo = max(40, int(V.min()) - dv)
-    return [[[h_lo, s_lo, v_lo], [h_hi, 255, 255]]]
-
-
 # ----------------------------- 配置读写 -----------------------------
 def load_config():
     if not os.path.exists(CONFIG_PATH):
@@ -156,16 +137,6 @@ class Grabber:
 
 
 # ----------------------------- 检测上下文(ROI 内预计算) -----------------------------
-def resolve_colors(cfg):
-    """整理颜色：bonus 缺省时回退到 blue(老配置不必重标也能用)。"""
-    c = dict(cfg.get("colors", {}))
-    if "bonus" not in c:
-        c["bonus"] = c.get("blue", DEFAULT_COLORS["bonus"])
-    for k in DEFAULT_COLORS:
-        c.setdefault(k, DEFAULT_COLORS[k])
-    return c
-
-
 def make_context(cfg):
     cx, cy = cfg["center"]
     r_in, r_out = cfg["r_inner"], cfg["r_outer"]
@@ -183,58 +154,66 @@ def make_context(cfg):
     radius = np.sqrt(dx * dx + dy * dy)
     angle = (np.degrees(np.arctan2(dy, dx)) % 360.0)
 
-    inner = (radius >= r_in) & (radius <= r_in + cfg["pointer_band"] * depth)   # 指针带
-    outer = (radius >= r_out - cfg["bar_band"] * depth) & (radius <= r_out)     # 弧条带
+    track = (radius >= r_in) & (radius <= r_out)                            # 整条环轨道(找弧条)
+    tip = (radius >= r_out - cfg["tip_band"] * depth) & (radius <= r_out)   # 外圈尖端(找发白的指针尖)
 
     return {
         "region": region,
         "angle": angle,
         "angle_int": angle.astype(np.int32),
-        "inner_u8": (inner.astype(np.uint8) * 255),
-        "outer_u8": (outer.astype(np.uint8) * 255),
-        "colors": resolve_colors(cfg),
+        "track_bool": track,
+        "tip_bool": tip,
         "cfg": cfg,
     }
 
 
-def color_mask(hsv, ranges, band_u8):
-    mask = None
-    for lo, hi in ranges:
-        m = cv2.inRange(hsv, np.array(lo, np.uint8), np.array(hi, np.uint8))
-        mask = m if mask is None else cv2.bitwise_or(mask, m)
-    return cv2.bitwise_and(mask, band_u8)
-
-
-def bars_from_mask(angle_int, mask, ctx, exclude_angle=None, exclude_half=0.0):
-    a = angle_int[mask > 0]
-    if a.size == 0:
-        return []
-    hist = np.bincount(a, minlength=360).astype(np.int64)
-    if exclude_angle is not None and exclude_half > 0:   # 抹掉指针附近，避免蓝针被当成条
-        c, h = int(round(exclude_angle)) % 360, int(exclude_half)
-        hist[(np.arange(c - h, c + h + 1) % 360)] = 0
-    active = hist >= ctx["cfg"]["bar_min_px"]
-    bars = []
-    for start, length in circular_runs(active):
-        if ctx["cfg"]["bar_min_arc"] <= length < 350:   # 太窄=噪点；太宽=误检整圈
-            bars.append({"center": (start + length / 2.0) % 360.0, "len": float(length)})
-    return bars
-
-
 def detect(frame_bgr, ctx):
-    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-    cols = ctx["colors"]
+    """不依赖固定颜色阈值：
+    指针 = 外圈尖端"发白(高 L + 低彩度)"的像素，与彩色弧条天然区分；
+    弧条 = 环上"相对底环显著偏离"的像素成段，再按 Lab-b(黄=b 高 / 蓝=b 低)分类，抗"亮度逐渐变低"。"""
+    cfg = ctx["cfg"]
+    lab = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2Lab)
+    L = lab[:, :, 0].astype(np.float32)
+    A = lab[:, :, 1].astype(np.float32)
+    Bc = lab[:, :, 2].astype(np.float32)
 
-    # 指针：蓝色 ∩ 内圈带
-    pmask = color_mask(hsv, cols["blue"], ctx["inner_u8"])
-    psel = pmask > 0
-    pointer = circular_mean_deg(ctx["angle"][psel]) if int(psel.sum()) >= ctx["cfg"]["pointer_min_px"] else None
+    # ---- 指针：外圈尖端的"白/亮"像素(高 L + 低彩) ----
+    tip = ctx["tip_bool"]
+    pointer = None
+    if tip.any():
+        chroma_t = np.sqrt((A[tip] - 128.0) ** 2 + (Bc[tip] - 128.0) ** 2)
+        sel = (L[tip] >= cfg["white_l_min"]) & (chroma_t <= cfg["white_chroma_max"])
+        if int(sel.sum()) >= cfg["pointer_min_px"]:
+            pointer = circular_mean_deg(ctx["angle"][tip][sel])
 
-    # 蓝加时条：外圈带，并排除指针附近(蓝针穿过外圈会留细线)
-    bonus = bars_from_mask(ctx["angle_int"], color_mask(hsv, cols["bonus"], ctx["outer_u8"]), ctx,
-                           exclude_angle=pointer, exclude_half=ctx["cfg"]["pointer_guard_deg"])
-    # 黄高亮条：外圈带(与蓝色不冲突，无需排除)
-    score = bars_from_mask(ctx["angle_int"], color_mask(hsv, cols["yellow"], ctx["outer_u8"]), ctx)
+    # ---- 弧条：整条环轨道上的显著像素 -> 成段 -> 按 b 分黄/蓝 ----
+    score, bonus = [], []
+    tr = ctx["track_bool"]
+    if tr.any():
+        Lt, At, Bt = L[tr], A[tr], Bc[tr]
+        base_b = float(np.median(Bt))
+        sal = np.maximum(0.0, Lt - np.median(Lt)) + np.sqrt((At - np.median(At)) ** 2 + (Bt - base_b) ** 2)
+        sel = sal >= cfg["arc_salience"]
+        if sel.any():
+            ang = ctx["angle_int"][tr][sel]
+            cnt = np.bincount(ang, minlength=360).astype(np.float64)
+            sdb = np.bincount(ang, weights=(Bt[sel] - base_b), minlength=360)
+            if pointer is not None:                      # 排除指针所在角度，避免被当成蓝条
+                c, h = int(round(pointer)) % 360, int(cfg["pointer_guard_deg"])
+                z = (np.arange(c - h, c + h + 1) % 360)
+                cnt[z] = 0.0
+                sdb[z] = 0.0
+            active = cnt >= cfg["bar_min_px"]
+            for start, length in circular_runs(active):
+                if not (cfg["bar_min_arc"] <= length < 350):
+                    continue
+                idxs = (np.arange(start, start + length) % 360)
+                mean_db = sdb[idxs].sum() / max(cnt[idxs].sum(), 1.0)   # 该段平均 b 偏离
+                bar = {"center": (start + length / 2.0) % 360.0, "len": float(length)}
+                if mean_db >= cfg["cls_b_margin"]:
+                    score.append(bar)                    # 偏黄 -> 高亮条
+                elif mean_db <= -cfg["cls_b_margin"]:
+                    bonus.append(bar)                    # 偏蓝 -> 加时条
     return pointer, score, bonus
 
 
@@ -295,7 +274,7 @@ def run(cfg, debug=False):
             (pydirectinput.mouseDown if on else pydirectinput.mouseUp)(button="right")
             boosting = on
 
-    last_log = 0.0
+    last_log, frames = 0.0, 0
     try:
         while not state["quit"]:
             now = time.perf_counter()
@@ -307,6 +286,7 @@ def run(cfg, debug=False):
                 time.sleep(0.02)
                 continue
 
+            frames += 1
             frame = g.grab(ctx["region"])
             pointer, score, bonus = detect(frame, ctx)
 
@@ -336,8 +316,9 @@ def run(cfg, debug=False):
                 set_boost(False)
 
             if now - last_log > 1.0:
-                last_log = now
-                print(f"\rptr={'-' if pointer is None else f'{pointer:6.1f}'} "
+                fps = frames / (now - last_log)
+                last_log, frames = now, 0
+                print(f"\rfps={fps:4.0f} ptr={'-' if pointer is None else f'{pointer:6.1f}'} "
                       f"w={omega:7.1f}/s bonus={len(bonus)} score={len(score)} "
                       f"boost={'Y' if boosting else 'n'}   ", end="")
 
@@ -364,11 +345,11 @@ def draw_debug(frame, ctx, pointer, score, bonus, boosting):
     R = int((cfg["r_inner"] + cfg["r_outer"]) / 2)
 
     def put_arc(bars, color):
-        for b in bars:
-            a = np.deg2rad(b["center"])
-            cv2.circle(img, (int(cxl + R * np.cos(a)), int(cyl + R * np.sin(a))), 5, color, -1)
+        for b in bars:                # 按实际弧长画弧，便于核对扇形范围与黄/蓝分类
+            a0, a1 = b["center"] - b["len"] / 2.0, b["center"] + b["len"] / 2.0
+            cv2.ellipse(img, (cxl, cyl), (R, R), 0, a0, a1, color, 3)
 
-    put_arc(score, (0, 255, 255))     # 黄
+    put_arc(score, (0, 255, 255))     # 黄(高亮条)
     put_arc(bonus, (255, 200, 0))     # 蓝(加时条)
     if pointer is not None:
         a = np.deg2rad(pointer)
@@ -396,24 +377,20 @@ def calibrate():
                   "请改成『窗口化 / 无边框窗口』模式，再在标定窗口里按 r 重抓。")
         return f
 
-    print("标定：先把游戏切到前台，让画面出现蓝指针 + 黄/蓝弧条。")
+    print("标定：先把游戏切到前台，露出表盘(画面里有没有弧条都行，本步只标圆环几何)。")
     frame = grab_check(3)
 
     H, W = frame.shape[:2]
-    scale = min(1.0, 1100.0 / max(W, H))
+    scale = min(1.0, 0.92 * mon["height"] / H, 0.92 * mon["width"] / W)   # 放大到接近全屏，刻度更大
     disp_w, disp_h = int(W * scale), int(H * scale)
 
-    # ring 步多点拟合圆(抹平点击误差)；color 步多点取色(覆盖渐变/发光，位置只为采色)
+    # 只标几何：外/内环各多点拟合圆(抹平点击误差)。颜色不再标定(运行时 Lab 自适应判别)
     steps = [
-        {"key": "outer",  "mode": "ring",  "tip": "沿[外环]边缘点 4~6 个点，按 n 下一步"},
-        {"key": "inner",  "mode": "ring",  "tip": "沿[内环]边缘点 4~6 个点，按 n 下一步"},
-        {"key": "blue",   "mode": "color", "tip": "沿[蓝色指针]点几个点(尤其内端蓝紫处)，n 下一步 / s 跳过"},
-        {"key": "bonus",  "mode": "color", "tip": "点[蓝色加时条]1~3 处取色，n 下一步 / s 跳过"},
-        {"key": "yellow", "mode": "color", "tip": "点[黄色高亮条]1~3 处取色，n 下一步 / s 跳过"},
+        {"key": "outer", "tip": "沿[外环]边缘点 4~6 个点，按 n 下一步"},
+        {"key": "inner", "tip": "沿[内环]边缘点 4~6 个点，按 n 下一步"},
     ]
     picks = {}
     idx = [0]
-    hsv_full = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
     def to_orig(mx, my):
         return int(mx / scale + mon["left"]), int(my / scale + mon["top"])
@@ -424,17 +401,9 @@ def calibrate():
     def on_mouse(event, mx, my, flags, _):
         if event != cv2.EVENT_LBUTTONDOWN or idx[0] >= len(steps):
             return
-        st = steps[idx[0]]
-        if st["mode"] == "ring":
-            picks.setdefault(st["key"], []).append(to_orig(mx, my))   # 累积，不自动前进
-        else:
-            iy, ix = int(my / scale), int(mx / scale)
-            patch = hsv_full[max(0, iy - 2):iy + 3, max(0, ix - 2):ix + 3].reshape(-1, 3)
-            med = np.median(patch, axis=0)
-            picks.setdefault(st["key"], []).append([float(med[0]), float(med[1]), float(med[2])])
-            print(f"  {st['key']} 采样 HSV={med.astype(int).tolist()}")    # 累积，不自动前进
+        picks.setdefault(steps[idx[0]]["key"], []).append(to_orig(mx, my))   # 累积，不自动前进
 
-    win = "calibrate (左键点击; n 下一步; s 跳过取色; r 重抓; Enter 保存; Esc 取消)"
+    win = "calibrate (左键点击环边; n 下一步; r 重抓; Enter 保存; Esc 取消)"
 
     def open_win():
         cv2.namedWindow(win)
@@ -459,39 +428,31 @@ def calibrate():
         for key, color in (("outer", (0, 200, 255)), ("inner", (0, 255, 120))):
             pts = picks.get(key, [])
             for ax, ay in pts:
-                cv2.circle(disp, to_disp(ax, ay), 3, color, -1)
+                cv2.circle(disp, to_disp(ax, ay), 2, color, -1)
             if len(pts) >= 3:
                 try:
                     a, b, R = fit_circle(pts)
-                    cv2.circle(disp, to_disp(a, b), int(R * scale), color, 1)
+                    cv2.circle(disp, to_disp(a, b), int(R * scale), color, 1, cv2.LINE_AA)  # 1px 抗锯齿细线
                 except Exception:
                     pass
         if done:
             tip = "完成: Enter 保存 / r 重抓 / Esc 取消"
         else:
             st = steps[idx[0]]
-            cnt = f"  已点 {len(picks.get(st['key'], []))} 个"
-            tip = f"[{idx[0]+1}/{len(steps)}] {st['tip']}{cnt}"
+            tip = f"[{idx[0]+1}/{len(steps)}] {st['tip']}  已点 {len(picks.get(st['key'], []))} 个"
         cv2.putText(disp, tip, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.imshow(win, disp)
 
         k = cv2.waitKey(20) & 0xFF
         if k == ord("n") and not done:
-            st = steps[idx[0]]
-            need = 3 if st["mode"] == "ring" else 1
-            if len(picks.get(st["key"], [])) < need:
-                print(f"！该环至少点 3 个点。" if st["mode"] == "ring"
-                      else "！至少点 1 个取色点（或按 s 跳过）。")
+            if len(picks.get(steps[idx[0]]["key"], [])) < 3:
+                print("！该环至少点 3 个点。")
             else:
                 idx[0] += 1
-        elif k == ord("s") and not done and steps[idx[0]]["mode"] == "color":
-            print(f"  跳过 {steps[idx[0]]['key']}")
-            idx[0] += 1
         elif k == ord("r"):
             cv2.destroyWindow(win)        # 先关掉标定窗口，免得把它自己截进去
             cv2.waitKey(1)
             frame = grab_check(2)
-            hsv_full = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
             picks.clear()
             idx[0] = 0
             open_win()
@@ -521,12 +482,6 @@ def calibrate():
     cfg["center"] = [int(round(cx)), int(round(cy))]
     cfg["r_inner"] = max(1, int(round(r_in)))
     cfg["r_outer"] = int(round(r_out))
-    # color 步的 picks[k] 是 HSV 采样点列表 -> 合成包围盒；没采的用默认
-    colors = {k: (build_hsv_box(picks[k]) if picks.get(k) else DEFAULT_COLORS[k])
-              for k in DEFAULT_COLORS}
-    if not picks.get("bonus") and picks.get("blue"):
-        colors["bonus"] = build_hsv_box(picks["blue"])   # 没单独取蓝加时条，沿用蓝指针的色
-    cfg["colors"] = colors
     save_config(cfg)
     print(f"圆心=({cfg['center'][0]},{cfg['center'][1]})  "
           f"外环 R={ro.mean():.1f}±{ro.std():.1f}  内环 R={ri.mean():.1f}±{ri.std():.1f}  "
@@ -537,7 +492,7 @@ def calibrate():
 # ----------------------------- 入口 -----------------------------
 def main():
     ap = argparse.ArgumentParser(description="轮盘撬锁 自动辅助")
-    ap.add_argument("--calibrate", action="store_true", help="标定圆心/半径/颜色")
+    ap.add_argument("--calibrate", action="store_true", help="标定表盘圆环几何(只点环)")
     ap.add_argument("--debug", action="store_true", help="运行时显示识别画面")
     args = ap.parse_args()
 
