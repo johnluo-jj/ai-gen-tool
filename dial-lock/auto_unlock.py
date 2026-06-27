@@ -254,6 +254,7 @@ def run(cfg, debug=False):
     prev_angle, prev_t = None, None
     omega = 0.0
     last_click = 0.0
+    clicks = 0
     boosting = False
     boost_cfg = cfg["boost"]
 
@@ -302,18 +303,20 @@ def run(cfg, debug=False):
                 else:
                     pydirectinput.click(button="left")      # 原地点击，不移动光标
                 last_click = now
+                clicks += 1
 
             if now - last_log > 1.0:
                 fps = frames / (now - last_log)
                 last_log, frames = now, 0
                 msg = (f"\rfps={fps:4.0f} ptr={'-' if pointer is None else f'{pointer:6.1f}'} "
-                       f"w={omega:7.1f}/s sectors={len(sectors)} boost={'Y' if boosting else 'n'}")
+                       f"w={omega:7.1f}/s nSec={len(sectors)} hit={'Y' if should_click else 'n'} "
+                       f"clicks={clicks} boost={'Y' if boosting else 'n'}")
                 if debug:
                     msg += "  " + " ".join(f"{k}={v}" for k, v in ctx.get("diag", {}).items())
                 print(msg + "   ", end="")
 
             if debug:
-                cv2.imshow("auto_unlock-debug", draw_debug(frame, ctx, pointer, sectors, boosting))
+                cv2.imshow("auto_unlock-debug", draw_debug(frame, ctx, pointer, sectors, boosting, should_click))
                 if cv2.waitKey(1) & 0xFF == 27:
                     break
     finally:
@@ -324,7 +327,7 @@ def run(cfg, debug=False):
         print("\n已退出。")
 
 
-def draw_debug(frame, ctx, pointer, sectors, boosting):
+def draw_debug(frame, ctx, pointer, sectors, boosting, should_click):
     img = frame.copy()
     cfg = ctx["cfg"]
     cx, cy = cfg["center"]
@@ -334,18 +337,31 @@ def draw_debug(frame, ctx, pointer, sectors, boosting):
     cv2.circle(img, (cxl, cyl), int(cfg["r_outer"]), (90, 90, 90), 1)
     R = int((cfg["r_inner"] + cfg["r_outer"]) / 2)
 
-    for s in sectors:                 # 按实际弧长画扇形；指针正落在其中=红(命中)，否则=黄
-        inside = pointer is not None and abs(ang_diff(pointer, s["center"])) <= s["len"] / 2.0
-        color = (0, 0, 255) if inside else (0, 220, 220)
+    # 命中(should_click)时扇形画红，否则黄。
+    # 注意：指针压到扇形上时多半会并入扇形(pointer=None)——那一刻正是命中，
+    # 所以按 should_click 上色(它已处理"pointer=None+有扇形=命中")，而不是看指针是否还独立可见。
+    for s in sectors:
+        color = (0, 0, 255) if should_click else (0, 220, 220)
         a0, a1 = s["center"] - s["len"] / 2.0, s["center"] + s["len"] / 2.0
         cv2.ellipse(img, (cxl, cyl), (R, R), 0, a0, a1, color, 3)
-    if pointer is not None:
+    if pointer is not None:           # 指针(细线)；并入扇形时无独立指针，不画线
         a = np.deg2rad(pointer)
         cv2.line(img, (cxl, cyl),
                  (int(cxl + cfg["r_outer"] * np.cos(a)), int(cyl + cfg["r_outer"] * np.sin(a))),
-                 (255, 120, 0), 2)     # 指针
-    cv2.putText(img, f"BOOST {'ON' if boosting else 'off'}", (8, 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                 (255, 120, 0), 2)
+
+    ptxt = "merged/None" if pointer is None else f"{pointer:.0f}"
+    cv2.putText(img, f"ptr={ptxt}  nSec={len(sectors)}  boost={'on' if boosting else 'off'}",
+                (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1, cv2.LINE_AA)
+    if should_click:                  # 真实点击决策：命中即大字提示
+        cv2.putText(img, "CLICK", (8, 54), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2, cv2.LINE_AA)
+    diag = ctx.get("diag", {})        # 诊断值叠到画面底部，方便直接截图给我看
+    if diag:
+        h = img.shape[0]
+        cv2.putText(img, f"runW={diag.get('runW')}", (8, h - 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(img, f"trkMaxSal={diag.get('trkMaxSal')}  salPx={diag.get('salPx')}", (8, h - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
     return img
 
 
