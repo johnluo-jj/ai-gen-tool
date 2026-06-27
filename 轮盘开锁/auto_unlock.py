@@ -100,6 +100,16 @@ def circular_runs(active):
     return runs
 
 
+def fit_circle(points):
+    """最小二乘(代数法)拟合圆，返回 (cx, cy, R)。多点拟合可抹平单点点击误差。"""
+    p = np.asarray(points, dtype=np.float64)
+    x, y = p[:, 0], p[:, 1]
+    A = np.column_stack([2 * x, 2 * y, np.ones(len(x))])
+    sol, *_ = np.linalg.lstsq(A, x * x + y * y, rcond=None)
+    a, b, c = sol
+    return float(a), float(b), float(np.sqrt(max(c + a * a + b * b, 0.0)))
+
+
 def build_hsv_ranges(h, s, v, dh=10, ds=80, dv=80):
     """由采样 HSV 中位数构造 inRange 范围(蓝色一般不跨界；保留通用红色跨 0/180 逻辑)"""
     h = int(h)
@@ -395,13 +405,13 @@ def calibrate():
     scale = min(1.0, 1100.0 / max(W, H))
     disp_w, disp_h = int(W * scale), int(H * scale)
 
+    # ring 步多点拟合圆(抹平点击误差)；color 步单点取色(位置无所谓，只采颜色)
     steps = [
-        ("点 [表盘圆心]", "center"),
-        ("点 [外环边缘]", "r_out"),
-        ("点 [内环边缘]", "r_in"),
-        ("点 [蓝色指针] (没有可按 s 跳过)", "blue"),
-        ("点 [蓝色加时条] (没有可按 s 跳过)", "bonus"),
-        ("点 [黄色高亮条] (没有可按 s 跳过)", "yellow"),
+        {"key": "outer",  "mode": "ring",  "tip": "沿[外环]边缘点 4~6 个点，按 n 下一步"},
+        {"key": "inner",  "mode": "ring",  "tip": "沿[内环]边缘点 4~6 个点，按 n 下一步"},
+        {"key": "blue",   "mode": "color", "tip": "点[蓝色指针]取色 (s 跳过)"},
+        {"key": "bonus",  "mode": "color", "tip": "点[蓝色加时条]取色 (s 跳过)"},
+        {"key": "yellow", "mode": "color", "tip": "点[黄色高亮条]取色 (s 跳过)"},
     ]
     picks = {}
     idx = [0]
@@ -410,21 +420,24 @@ def calibrate():
     def to_orig(mx, my):
         return int(mx / scale + mon["left"]), int(my / scale + mon["top"])
 
+    def to_disp(ax, ay):
+        return int((ax - mon["left"]) * scale), int((ay - mon["top"]) * scale)
+
     def on_mouse(event, mx, my, flags, _):
         if event != cv2.EVENT_LBUTTONDOWN or idx[0] >= len(steps):
             return
-        key = steps[idx[0]][1]
-        if key in ("center", "r_out", "r_in"):
-            picks[key] = to_orig(mx, my)
+        st = steps[idx[0]]
+        if st["mode"] == "ring":
+            picks.setdefault(st["key"], []).append(to_orig(mx, my))   # 累积，不自动前进
         else:
             iy, ix = int(my / scale), int(mx / scale)
             patch = hsv_full[max(0, iy - 2):iy + 3, max(0, ix - 2):ix + 3].reshape(-1, 3)
             med = np.median(patch, axis=0)
-            picks[key] = build_hsv_ranges(med[0], med[1], med[2])
-            print(f"  {key} 采样 HSV={med.astype(int).tolist()}")
-        idx[0] += 1
+            picks[st["key"]] = build_hsv_ranges(med[0], med[1], med[2])
+            print(f"  {st['key']} 采样 HSV={med.astype(int).tolist()}")
+            idx[0] += 1
 
-    win = "calibrate (左键依次点击; s 跳过当前; r 重抓; Enter 保存; Esc 取消)"
+    win = "calibrate (左键点击; n 下一步; s 跳过取色; r 重抓; Enter 保存; Esc 取消)"
 
     def open_win():
         cv2.namedWindow(win)
@@ -436,18 +449,43 @@ def calibrate():
         cv2.setMouseCallback(win, on_mouse)
 
     open_win()
-    print("标定窗口已弹出并置顶；若仍被游戏挡住，Alt+Tab 切到 'calibrate' 窗口。"
-          "画面是冻结的，可以慢慢点。")
+    print("标定窗口已弹出并置顶；若仍被游戏挡住，Alt+Tab 切到 'calibrate' 窗口。画面是冻结的，可慢慢点。")
+    print("外环/内环各点 4~6 个点(越多越准)，会实时画出拟合圆；贴住环线后按 n 进入下一步。")
+
+    def ring_ok():
+        return len(picks.get("outer", [])) >= 3 and len(picks.get("inner", [])) >= 3
 
     while True:
         disp = cv2.resize(frame, (disp_w, disp_h))
-        tip = (f"[{idx[0]+1}/{len(steps)}] {steps[idx[0]][0]}"
-               if idx[0] < len(steps) else "完成: Enter 保存 / r 重抓 / Esc 取消")
-        cv2.putText(disp, tip, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        done = idx[0] >= len(steps)
+        # 画已点的环点 + 拟合圆预览
+        for key, color in (("outer", (0, 200, 255)), ("inner", (0, 255, 120))):
+            pts = picks.get(key, [])
+            for ax, ay in pts:
+                cv2.circle(disp, to_disp(ax, ay), 3, color, -1)
+            if len(pts) >= 3:
+                try:
+                    a, b, R = fit_circle(pts)
+                    cv2.circle(disp, to_disp(a, b), int(R * scale), color, 1)
+                except Exception:
+                    pass
+        if done:
+            tip = "完成: Enter 保存 / r 重抓 / Esc 取消"
+        else:
+            st = steps[idx[0]]
+            cnt = f"  已点 {len(picks.get(st['key'], []))} 个" if st["mode"] == "ring" else ""
+            tip = f"[{idx[0]+1}/{len(steps)}] {st['tip']}{cnt}"
+        cv2.putText(disp, tip, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.imshow(win, disp)
+
         k = cv2.waitKey(20) & 0xFF
-        if k == ord("s") and idx[0] < len(steps):
-            print(f"  跳过 {steps[idx[0]][1]}")
+        if k == ord("n") and not done:
+            if steps[idx[0]]["mode"] == "ring" and len(picks.get(steps[idx[0]]["key"], [])) < 3:
+                print("！该环至少点 3 个点。")
+            else:
+                idx[0] += 1
+        elif k == ord("s") and not done and steps[idx[0]]["mode"] == "color":
+            print(f"  跳过 {steps[idx[0]]['key']}")
             idx[0] += 1
         elif k == ord("r"):
             cv2.destroyWindow(win)        # 先关掉标定窗口，免得把它自己截进去
@@ -458,30 +496,40 @@ def calibrate():
             idx[0] = 0
             open_win()
         elif k == 13:    # Enter
-            if all(j in picks for j in ("center", "r_out", "r_in")):
+            if ring_ok():
                 break
-            print("！圆心/外环/内环 必须全部点击。")
+            print("！外环/内环 各至少点 3 个点。")
         elif k == 27:    # Esc
             cv2.destroyAllWindows()
             sys.exit("已取消标定。")
 
     cv2.destroyAllWindows()
 
-    cx, cy = picks["center"]
-    r_out = int(round(np.hypot(picks["r_out"][0] - cx, picks["r_out"][1] - cy)))
-    r_in = int(round(np.hypot(picks["r_in"][0] - cx, picks["r_in"][1] - cy)))
-    r_in, r_out = sorted((r_in, r_out))
+    # 外/内环各自拟合圆 -> 取两圆心均值为公共圆心 -> 半径用到该圆心的平均距离
+    oa, ob, _ = fit_circle(picks["outer"])
+    ia, ib, _ = fit_circle(picks["inner"])
+    cx, cy = (oa + ia) / 2.0, (ob + ib) / 2.0
+
+    def radii(pts):
+        p = np.asarray(pts, dtype=np.float64)
+        return np.hypot(p[:, 0] - cx, p[:, 1] - cy)
+
+    ro, ri = radii(picks["outer"]), radii(picks["inner"])
+    r_out, r_in = sorted((ro.mean(), ri.mean()))
 
     cfg = dict(DEFAULTS)
-    cfg["center"] = [int(cx), int(cy)]
-    cfg["r_inner"] = max(1, r_in)
-    cfg["r_outer"] = r_out
+    cfg["center"] = [int(round(cx)), int(round(cy))]
+    cfg["r_inner"] = max(1, int(round(r_in)))
+    cfg["r_outer"] = int(round(r_out))
+    # DEFAULT_COLORS 只含 blue/bonus/yellow，不含 outer/inner，故天然排除环点
     colors = {k: picks.get(k, DEFAULT_COLORS[k]) for k in DEFAULT_COLORS}
     if "bonus" not in picks and "blue" in picks:
         colors["bonus"] = picks["blue"]        # 没单独取蓝加时条，则沿用蓝指针的蓝
     cfg["colors"] = colors
     save_config(cfg)
-    print(f"圆心=({cx},{cy}) 内径={r_in} 外径={r_out}")
+    print(f"圆心=({cfg['center'][0]},{cfg['center'][1]})  "
+          f"外环 R={ro.mean():.1f}±{ro.std():.1f}  内环 R={ri.mean():.1f}±{ri.std():.1f}  "
+          f"(±越小越准)")
     print("建议先用 --debug 跑一遍看识别准不准：python auto_unlock.py --debug")
 
 
