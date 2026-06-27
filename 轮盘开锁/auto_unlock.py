@@ -44,9 +44,7 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.j
 DEFAULTS = {
     "latency": 0.05,            # 总延迟(秒)：截屏+处理+系统点击；命中率主要靠它调
     "min_click_interval": 0.16, # 两次点击最小间隔(秒)，防抖
-    "fire_base_tol": 2.5,       # 瞄准弧条中心的基础角度容差(度)
-    "arc_salience": 22,         # 弧条阈值：环上像素相对底环的"亮+彩"偏离≥此值算弧条(抗褪色)
-    "cls_b_margin": 8,          # 黄/蓝分类：弧条平均 Lab-b 偏离 >+此值=黄，<-此值=蓝
+    "arc_salience": 22,         # 扇形阈值：环上像素相对底环的"亮+彩"偏离≥此值算扇形(抗褪色)
     "white_l_min": 200,         # 指针：尖端"发白"像素的最低亮度 L(0-255)
     "white_chroma_max": 30,     # 指针：尖端像素最大彩度(越小越"白"，借此与彩色弧条区分)
     "tip_band": 0.35,           # 指针尖端检测带：外圈末尾该比例*环宽
@@ -168,9 +166,9 @@ def make_context(cfg):
 
 
 def detect(frame_bgr, ctx):
-    """不依赖固定颜色阈值：
-    指针 = 外圈尖端"发白(高 L + 低彩度)"的像素，与彩色弧条天然区分；
-    弧条 = 环上"相对底环显著偏离"的像素成段，再按 Lab-b(黄=b 高 / 蓝=b 低)分类，抗"亮度逐渐变低"。"""
+    """只关心"是否命中"，不分黄/蓝：
+    指针 = 外圈尖端"发白(高 L + 低彩度)"的像素；
+    扇形 = 环上"相对底环显著偏离"的像素成段(抗变暗)。返回 (pointer, sectors)。"""
     cfg = ctx["cfg"]
     lab = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2Lab)
     L = lab[:, :, 0].astype(np.float32)
@@ -186,59 +184,42 @@ def detect(frame_bgr, ctx):
         if int(sel.sum()) >= cfg["pointer_min_px"]:
             pointer = circular_mean_deg(ctx["angle"][tip][sel])
 
-    # ---- 弧条：整条环轨道上的显著像素 -> 成段 -> 按 b 分黄/蓝 ----
-    score, bonus = [], []
+    # ---- 扇形：环轨道上的显著像素 -> 成段(不分黄蓝，只看"有没有/在哪") ----
+    sectors = []
     tr = ctx["track_bool"]
     if tr.any():
         Lt, At, Bt = L[tr], A[tr], Bc[tr]
-        base_b = float(np.median(Bt))
-        sal = np.maximum(0.0, Lt - np.median(Lt)) + np.sqrt((At - np.median(At)) ** 2 + (Bt - base_b) ** 2)
+        sal = np.maximum(0.0, Lt - np.median(Lt)) + np.sqrt((At - np.median(At)) ** 2 + (Bt - np.median(Bt)) ** 2)
         sel = sal >= cfg["arc_salience"]
         if sel.any():
-            ang = ctx["angle_int"][tr][sel]
-            cnt = np.bincount(ang, minlength=360).astype(np.float64)
-            sdb = np.bincount(ang, weights=(Bt[sel] - base_b), minlength=360)
-            if pointer is not None:                      # 排除指针所在角度，避免被当成蓝条
+            cnt = np.bincount(ctx["angle_int"][tr][sel], minlength=360)
+            if pointer is not None:                      # 排除指针所在角度，避免指针自身被当成扇形
                 c, h = int(round(pointer)) % 360, int(cfg["pointer_guard_deg"])
-                z = (np.arange(c - h, c + h + 1) % 360)
-                cnt[z] = 0.0
-                sdb[z] = 0.0
-            active = cnt >= cfg["bar_min_px"]
-            for start, length in circular_runs(active):
-                if not (cfg["bar_min_arc"] <= length < 350):
-                    continue
-                idxs = (np.arange(start, start + length) % 360)
-                mean_db = sdb[idxs].sum() / max(cnt[idxs].sum(), 1.0)   # 该段平均 b 偏离
-                bar = {"center": (start + length / 2.0) % 360.0, "len": float(length)}
-                if mean_db >= cfg["cls_b_margin"]:
-                    score.append(bar)                    # 偏黄 -> 高亮条
-                elif mean_db <= -cfg["cls_b_margin"]:
-                    bonus.append(bar)                    # 偏蓝 -> 加时条
-    return pointer, score, bonus
+                cnt[(np.arange(c - h, c + h + 1) % 360)] = 0
+            for start, length in circular_runs(cnt >= cfg["bar_min_px"]):
+                if cfg["bar_min_arc"] <= length < 350:
+                    sectors.append({"center": (start + length / 2.0) % 360.0, "len": float(length)})
+    return pointer, sectors
 
 
 # ----------------------------- 决策 -----------------------------
-def edge_distance(pointer, bar):
-    """指针到弧条最近边缘的角距(已在条内则为 0)"""
-    return max(0.0, abs(ang_diff(bar["center"], pointer)) - bar["len"] / 2.0)
+def edge_distance(pointer, sector):
+    """指针到扇形最近边缘的角距(已在扇形内则为 0)"""
+    return max(0.0, abs(ang_diff(sector["center"], pointer)) - sector["len"] / 2.0)
 
 
-def choose_and_decide(pointer, omega, dt, score, bonus, cfg):
-    """瞄准弧条"中心"：当(含延迟提前量的)预测点扫到中心时点击。蓝色加时条优先。
-    瞄中心而非整条，可抗"弧长逐渐变细"——边缘会缩、中心不动。
+def choose_and_decide(pointer, omega, dt, sectors, cfg):
+    """命中即点：指针(含延迟提前量)落入任一扇形的角度区间就点。不分黄/蓝、不排优先级。
     返回 (should_click, nearest_edge_dist)。"""
     predicted = pointer + omega * cfg["latency"]
-    fire_tol = max(cfg["fire_base_tol"], 0.6 * abs(omega) * dt)   # 至少覆盖一帧角位移，避免跨过中心
-
+    guard = 0.5 * abs(omega) * dt                # 高速时半帧角位移，避免两帧间跨过窄扇形而漏判
     should_click = False
-    for bar in bonus + score:                       # 蓝条优先(放前面)
-        err = ang_diff(predicted, bar["center"])                       # 预测点相对中心
-        approaching = (omega * ang_diff(bar["center"], pointer)) > 0   # 中心在前进方向上
-        if abs(err) <= fire_tol and (approaching or abs(err) <= cfg["fire_base_tol"]):
+    nearest = None
+    for s in sectors:
+        if abs(ang_diff(predicted, s["center"])) <= s["len"] / 2.0 + guard:
             should_click = True
-            break
-
-    nearest = min((edge_distance(pointer, b) for b in bonus + score), default=None)
+        e = edge_distance(pointer, s)
+        nearest = e if nearest is None else min(nearest, e)
     return should_click, nearest
 
 
@@ -288,7 +269,7 @@ def run(cfg, debug=False):
 
             frames += 1
             frame = g.grab(ctx["region"])
-            pointer, score, bonus = detect(frame, ctx)
+            pointer, sectors = detect(frame, ctx)
 
             if pointer is not None:
                 dt = (now - prev_t) if prev_t is not None else 0.016
@@ -297,7 +278,7 @@ def run(cfg, debug=False):
                     omega = 0.5 * w + 0.5 * omega           # 轻度平滑，反向时也能较快跟上
                 prev_angle, prev_t = pointer, now
 
-                should_click, nearest = choose_and_decide(pointer, omega, dt, score, bonus, cfg)
+                should_click, nearest = choose_and_decide(pointer, omega, dt, sectors, cfg)
 
                 if boost_cfg["enabled"] and nearest is not None and nearest > boost_cfg["release_deg"]:
                     set_boost(True)        # 离目标远 -> 加速
@@ -319,11 +300,11 @@ def run(cfg, debug=False):
                 fps = frames / (now - last_log)
                 last_log, frames = now, 0
                 print(f"\rfps={fps:4.0f} ptr={'-' if pointer is None else f'{pointer:6.1f}'} "
-                      f"w={omega:7.1f}/s bonus={len(bonus)} score={len(score)} "
+                      f"w={omega:7.1f}/s sectors={len(sectors)} "
                       f"boost={'Y' if boosting else 'n'}   ", end="")
 
             if debug:
-                cv2.imshow("auto_unlock-debug", draw_debug(frame, ctx, pointer, score, bonus, boosting))
+                cv2.imshow("auto_unlock-debug", draw_debug(frame, ctx, pointer, sectors, boosting))
                 if cv2.waitKey(1) & 0xFF == 27:
                     break
     finally:
@@ -334,7 +315,7 @@ def run(cfg, debug=False):
         print("\n已退出。")
 
 
-def draw_debug(frame, ctx, pointer, score, bonus, boosting):
+def draw_debug(frame, ctx, pointer, sectors, boosting):
     img = frame.copy()
     cfg = ctx["cfg"]
     cx, cy = cfg["center"]
@@ -344,18 +325,16 @@ def draw_debug(frame, ctx, pointer, score, bonus, boosting):
     cv2.circle(img, (cxl, cyl), int(cfg["r_outer"]), (90, 90, 90), 1)
     R = int((cfg["r_inner"] + cfg["r_outer"]) / 2)
 
-    def put_arc(bars, color):
-        for b in bars:                # 按实际弧长画弧，便于核对扇形范围与黄/蓝分类
-            a0, a1 = b["center"] - b["len"] / 2.0, b["center"] + b["len"] / 2.0
-            cv2.ellipse(img, (cxl, cyl), (R, R), 0, a0, a1, color, 3)
-
-    put_arc(score, (0, 255, 255))     # 黄(高亮条)
-    put_arc(bonus, (255, 200, 0))     # 蓝(加时条)
+    for s in sectors:                 # 按实际弧长画扇形；指针正落在其中=红(命中)，否则=黄
+        inside = pointer is not None and abs(ang_diff(pointer, s["center"])) <= s["len"] / 2.0
+        color = (0, 0, 255) if inside else (0, 220, 220)
+        a0, a1 = s["center"] - s["len"] / 2.0, s["center"] + s["len"] / 2.0
+        cv2.ellipse(img, (cxl, cyl), (R, R), 0, a0, a1, color, 3)
     if pointer is not None:
         a = np.deg2rad(pointer)
         cv2.line(img, (cxl, cyl),
                  (int(cxl + cfg["r_outer"] * np.cos(a)), int(cyl + cfg["r_outer"] * np.sin(a))),
-                 (255, 120, 0), 2)     # 蓝指针
+                 (255, 120, 0), 2)     # 指针
     cv2.putText(img, f"BOOST {'ON' if boosting else 'off'}", (8, 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
     return img
