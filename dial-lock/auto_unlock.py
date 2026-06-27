@@ -44,14 +44,10 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.j
 DEFAULTS = {
     "latency": 0.05,            # 总延迟(秒)：截屏+处理+系统点击；命中率主要靠它调
     "min_click_interval": 0.16, # 两次点击最小间隔(秒)，防抖
-    "arc_salience": 22,         # 扇形阈值：环上像素相对底环的"亮+彩"偏离≥此值算扇形(抗褪色)
-    "white_l_min": 200,         # 指针：尖端"发白"像素的最低亮度 L(0-255)
-    "white_chroma_max": 30,     # 指针：尖端像素最大彩度(越小越"白"，借此与彩色弧条区分)
-    "tip_band": 0.35,           # 指针尖端检测带：外圈末尾该比例*环宽
-    "pointer_guard_deg": 8,     # 找弧条时排除指针±该角度，避免指针被当成条
-    "pointer_min_px": 6,        # 指针被认定所需最少像素
-    "bar_min_px": 5,            # 某角度上被算作"条"所需最少像素
-    "bar_min_arc": 4,           # 弧条最小角宽(度)：放小以便识别"逐渐变细"的条
+    "arc_salience": 22,         # 显著阈值：环上像素相对底环的"亮+彩"偏离≥此值算"有东西"(抗褪色)
+    "bar_min_px": 5,            # 某角度上算"有东西"所需最少像素
+    "pointer_max_arc": 6,       # 指针/扇形分界(度)：≤此值的细段=指针，>此值=扇形(实测指针恒定4~5°，留+1°余量)
+    "bar_max_arc": 35,          # 扇形角宽上限(度)：扇形基本不超过~30°，更宽的判为非扇形(误检/反光)
     "click_pos": None,          # 左键点击坐标[x,y]；null=原地点击(不移动光标，光标由你自己停好)
     "boost": {"enabled": True, "release_deg": 22.0},  # 自适应加速：离目标>该角度则按住右键
 }
@@ -152,53 +148,55 @@ def make_context(cfg):
     radius = np.sqrt(dx * dx + dy * dy)
     angle = (np.degrees(np.arctan2(dy, dx)) % 360.0)
 
-    track = (radius >= r_in) & (radius <= r_out)                            # 整条环轨道(找弧条)
-    tip = (radius >= r_out - cfg["tip_band"] * depth) & (radius <= r_out)   # 外圈尖端(找发白的指针尖)
+    track = (radius >= r_in) & (radius <= r_out)        # 整条环轨道(指针 + 扇形都在这)
 
     return {
         "region": region,
         "angle": angle,
         "angle_int": angle.astype(np.int32),
         "track_bool": track,
-        "tip_bool": tip,
         "cfg": cfg,
     }
 
 
 def detect(frame_bgr, ctx):
-    """只关心"是否命中"，不分黄/蓝：
-    指针 = 外圈尖端"发白(高 L + 低彩度)"的像素；
-    扇形 = 环上"相对底环显著偏离"的像素成段(抗变暗)。返回 (pointer, sectors)。"""
+    """把环带里所有"显著径向段"切出来，按角宽分类：
+      细段(≤pointer_max_arc) = 指针；宽段(pointer_max_arc~bar_max_arc) = 扇形(无死区)。
+    指针落在某扇形角度内即命中；指针并入扇形时没有独立细段(决策里按"已在扇形内"处理)。
+    返回 (pointer, sectors)。"""
     cfg = ctx["cfg"]
     lab = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2Lab)
     L = lab[:, :, 0].astype(np.float32)
     A = lab[:, :, 1].astype(np.float32)
     Bc = lab[:, :, 2].astype(np.float32)
+    diag = {}
 
-    # ---- 指针：外圈尖端的"白/亮"像素(高 L + 低彩) ----
-    tip = ctx["tip_bool"]
     pointer = None
-    if tip.any():
-        chroma_t = np.sqrt((A[tip] - 128.0) ** 2 + (Bc[tip] - 128.0) ** 2)
-        sel = (L[tip] >= cfg["white_l_min"]) & (chroma_t <= cfg["white_chroma_max"])
-        if int(sel.sum()) >= cfg["pointer_min_px"]:
-            pointer = circular_mean_deg(ctx["angle"][tip][sel])
-
-    # ---- 扇形：环轨道上的显著像素 -> 成段(不分黄蓝，只看"有没有/在哪") ----
     sectors = []
     tr = ctx["track_bool"]
     if tr.any():
         Lt, At, Bt = L[tr], A[tr], Bc[tr]
         sal = np.maximum(0.0, Lt - np.median(Lt)) + np.sqrt((At - np.median(At)) ** 2 + (Bt - np.median(Bt)) ** 2)
         sel = sal >= cfg["arc_salience"]
+        diag["trkMaxSal"] = int(sal.max())                  # 环上最大显著度(看 arc_salience 该多少)
+        diag["salPx"] = int(sel.sum())                      # 超过 arc_salience 的像素数
         if sel.any():
             cnt = np.bincount(ctx["angle_int"][tr][sel], minlength=360)
-            if pointer is not None:                      # 排除指针所在角度，避免指针自身被当成扇形
-                c, h = int(round(pointer)) % 360, int(cfg["pointer_guard_deg"])
-                cnt[(np.arange(c - h, c + h + 1) % 360)] = 0
+            best_ptr_px = -1
+            widths = []
             for start, length in circular_runs(cnt >= cfg["bar_min_px"]):
-                if cfg["bar_min_arc"] <= length < 350:
-                    sectors.append({"center": (start + length / 2.0) % 360.0, "len": float(length)})
+                widths.append(int(length))
+                center = (start + length / 2.0) % 360.0
+                if length <= cfg["pointer_max_arc"]:                          # 细 -> 指针(取像素最多的细段)
+                    px = int(cnt[(np.arange(start, start + length) % 360)].sum())
+                    if px > best_ptr_px:
+                        best_ptr_px, pointer = px, center
+                elif length <= cfg["bar_max_arc"]:                            # 宽 -> 扇形(下界=pointer_max_arc，无死区)
+                    sectors.append({"center": center, "len": float(length)})
+            diag["runW"] = sorted(widths, reverse=True)     # 所有段的角宽(看 pointer_max_arc 该多少)
+    diag["ptr"] = "-" if pointer is None else int(pointer)
+    diag["nSec"] = len(sectors)
+    ctx["diag"] = diag
     return pointer, sectors
 
 
@@ -209,8 +207,12 @@ def edge_distance(pointer, sector):
 
 
 def choose_and_decide(pointer, omega, dt, sectors, cfg):
-    """命中即点：指针(含延迟提前量)落入任一扇形的角度区间就点。不分黄/蓝、不排优先级。
-    返回 (should_click, nearest_edge_dist)。"""
+    """命中即点，不分黄/蓝、不排优先级。返回 (should_click, nearest_edge_dist)。
+    - 指针有独立细段：其(含延迟提前量)落入某扇形角度区间就点；
+    - 指针没切出独立细段：说明已并入某扇形(指针很细、被宽段吞掉)，有扇形即判命中。"""
+    if pointer is None:
+        return len(sectors) > 0, None
+
     predicted = pointer + omega * cfg["latency"]
     guard = 0.5 * abs(omega) * dt                # 高速时半帧角位移，避免两帧间跨过窄扇形而漏判
     should_click = False
@@ -236,12 +238,18 @@ def run(cfg, debug=False):
     click_pos = cfg["click_pos"]   # None=原地点击(光标由你自己停在不影响区，bot 不动鼠标)
 
     state = {"running": False, "quit": False}
-    keyboard.add_hotkey("f8", lambda: state.update(running=not state["running"]))
+
+    def toggle():
+        state["running"] = not state["running"]
+        print(f"\n{'▶ 运行中' if state['running'] else '⏸ 已暂停'}")
+
+    keyboard.add_hotkey("f8", toggle)
     keyboard.add_hotkey("f9", lambda: state.update(quit=True))
 
     print("就绪。把鼠标放到游戏窗口内 -> 按 F8 开始/暂停，F9 退出。")
+    print("（按 F8 若没看到 “▶ 运行中”，多半是热键没被收到：请用管理员身份运行本脚本。）")
     if debug:
-        print("debug 窗口已开，可据此微调 config.json 的颜色/半径带/阈值。")
+        print("debug：控制台会多打 runW/trkMaxSal/salPx/ptr/nSec，用于据实调阈值。")
 
     prev_angle, prev_t = None, None
     omega = 0.0
@@ -271,37 +279,38 @@ def run(cfg, debug=False):
             frame = g.grab(ctx["region"])
             pointer, sectors = detect(frame, ctx)
 
+            dt = (now - prev_t) if prev_t is not None else 0.016
             if pointer is not None:
-                dt = (now - prev_t) if prev_t is not None else 0.016
                 if prev_angle is not None and dt > 0:
                     w = ang_diff(pointer, prev_angle) / dt
                     omega = 0.5 * w + 0.5 * omega           # 轻度平滑，反向时也能较快跟上
                 prev_angle, prev_t = pointer, now
-
-                should_click, nearest = choose_and_decide(pointer, omega, dt, sectors, cfg)
-
-                if boost_cfg["enabled"] and nearest is not None and nearest > boost_cfg["release_deg"]:
-                    set_boost(True)        # 离目标远 -> 加速
-                else:
-                    set_boost(False)       # 临近/无目标 -> 松开保精度
-
-                if should_click and (now - last_click) >= cfg["min_click_interval"]:
-                    set_boost(False)                       # 点击瞬间确保不在加速
-                    if click_pos:
-                        pydirectinput.click(click_pos[0], click_pos[1], button="left")
-                    else:
-                        pydirectinput.click(button="left")  # 原地点击，不移动光标
-                    last_click = now
             else:
-                prev_angle, prev_t = None, None
-                set_boost(False)
+                prev_angle, prev_t, omega = None, None, 0.0  # 指针并入扇形/丢失：不更新速度
+
+            should_click, nearest = choose_and_decide(pointer, omega, dt, sectors, cfg)
+
+            if boost_cfg["enabled"] and nearest is not None and nearest > boost_cfg["release_deg"]:
+                set_boost(True)            # 离目标远 -> 加速
+            else:
+                set_boost(False)           # 临近/无目标 -> 松开保精度
+
+            if should_click and (now - last_click) >= cfg["min_click_interval"]:
+                set_boost(False)                           # 点击瞬间确保不在加速
+                if click_pos:
+                    pydirectinput.click(click_pos[0], click_pos[1], button="left")
+                else:
+                    pydirectinput.click(button="left")      # 原地点击，不移动光标
+                last_click = now
 
             if now - last_log > 1.0:
                 fps = frames / (now - last_log)
                 last_log, frames = now, 0
-                print(f"\rfps={fps:4.0f} ptr={'-' if pointer is None else f'{pointer:6.1f}'} "
-                      f"w={omega:7.1f}/s sectors={len(sectors)} "
-                      f"boost={'Y' if boosting else 'n'}   ", end="")
+                msg = (f"\rfps={fps:4.0f} ptr={'-' if pointer is None else f'{pointer:6.1f}'} "
+                       f"w={omega:7.1f}/s sectors={len(sectors)} boost={'Y' if boosting else 'n'}")
+                if debug:
+                    msg += "  " + " ".join(f"{k}={v}" for k, v in ctx.get("diag", {}).items())
+                print(msg + "   ", end="")
 
             if debug:
                 cv2.imshow("auto_unlock-debug", draw_debug(frame, ctx, pointer, sectors, boosting))
