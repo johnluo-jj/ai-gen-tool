@@ -110,21 +110,19 @@ def fit_circle(points):
     return float(a), float(b), float(np.sqrt(max(c + a * a + b * b, 0.0)))
 
 
-def build_hsv_ranges(h, s, v, dh=10, ds=80, dv=80):
-    """由采样 HSV 中位数构造 inRange 范围(蓝色一般不跨界；保留通用红色跨 0/180 逻辑)"""
-    h = int(h)
-    s_lo, v_lo = max(int(s) - ds, 60), max(int(v) - dv, 60)
-    lo1, hi1 = h - dh, h + dh
-    out = []
-    if lo1 < 0:
-        out.append([[0, s_lo, v_lo], [hi1, 255, 255]])
-        out.append([[180 + lo1, s_lo, v_lo], [179, 255, 255]])
-    elif hi1 > 179:
-        out.append([[lo1, s_lo, v_lo], [179, 255, 255]])
-        out.append([[0, s_lo, v_lo], [hi1 - 180, 255, 255]])
-    else:
-        out.append([[lo1, s_lo, v_lo], [hi1, 255, 255]])
-    return out
+def build_hsv_box(samples, dh=8, ds=70, dv=80):
+    """由多个 HSV 采样点合成一个 inRange 范围，覆盖"渐变/发光"的元素(如蓝紫→近白的指针)。
+    色相只用较饱和的样本来定(白端 H 是噪声)；放宽 S/V 下限以覆盖偏白部分。
+    samples: [[H,S,V], ...]（H:0-179）。返回 [[lo, hi]]。"""
+    a = np.asarray(samples, dtype=np.float64)
+    H, S, V = a[:, 0], a[:, 1], a[:, 2]
+    sat = S >= 80
+    Hs = H[sat] if sat.any() else H
+    h_lo = max(0, int(Hs.min()) - dh)
+    h_hi = min(179, int(Hs.max()) + dh)
+    s_lo = max(35, int(S.min()) - ds)         # floor 35：别低到匹配纯灰白
+    v_lo = max(40, int(V.min()) - dv)
+    return [[[h_lo, s_lo, v_lo], [h_hi, 255, 255]]]
 
 
 # ----------------------------- 配置读写 -----------------------------
@@ -405,13 +403,13 @@ def calibrate():
     scale = min(1.0, 1100.0 / max(W, H))
     disp_w, disp_h = int(W * scale), int(H * scale)
 
-    # ring 步多点拟合圆(抹平点击误差)；color 步单点取色(位置无所谓，只采颜色)
+    # ring 步多点拟合圆(抹平点击误差)；color 步多点取色(覆盖渐变/发光，位置只为采色)
     steps = [
         {"key": "outer",  "mode": "ring",  "tip": "沿[外环]边缘点 4~6 个点，按 n 下一步"},
         {"key": "inner",  "mode": "ring",  "tip": "沿[内环]边缘点 4~6 个点，按 n 下一步"},
-        {"key": "blue",   "mode": "color", "tip": "点[蓝色指针]取色 (s 跳过)"},
-        {"key": "bonus",  "mode": "color", "tip": "点[蓝色加时条]取色 (s 跳过)"},
-        {"key": "yellow", "mode": "color", "tip": "点[黄色高亮条]取色 (s 跳过)"},
+        {"key": "blue",   "mode": "color", "tip": "沿[蓝色指针]点几个点(尤其内端蓝紫处)，n 下一步 / s 跳过"},
+        {"key": "bonus",  "mode": "color", "tip": "点[蓝色加时条]1~3 处取色，n 下一步 / s 跳过"},
+        {"key": "yellow", "mode": "color", "tip": "点[黄色高亮条]1~3 处取色，n 下一步 / s 跳过"},
     ]
     picks = {}
     idx = [0]
@@ -433,9 +431,8 @@ def calibrate():
             iy, ix = int(my / scale), int(mx / scale)
             patch = hsv_full[max(0, iy - 2):iy + 3, max(0, ix - 2):ix + 3].reshape(-1, 3)
             med = np.median(patch, axis=0)
-            picks[st["key"]] = build_hsv_ranges(med[0], med[1], med[2])
-            print(f"  {st['key']} 采样 HSV={med.astype(int).tolist()}")
-            idx[0] += 1
+            picks.setdefault(st["key"], []).append([float(med[0]), float(med[1]), float(med[2])])
+            print(f"  {st['key']} 采样 HSV={med.astype(int).tolist()}")    # 累积，不自动前进
 
     win = "calibrate (左键点击; n 下一步; s 跳过取色; r 重抓; Enter 保存; Esc 取消)"
 
@@ -473,15 +470,18 @@ def calibrate():
             tip = "完成: Enter 保存 / r 重抓 / Esc 取消"
         else:
             st = steps[idx[0]]
-            cnt = f"  已点 {len(picks.get(st['key'], []))} 个" if st["mode"] == "ring" else ""
+            cnt = f"  已点 {len(picks.get(st['key'], []))} 个"
             tip = f"[{idx[0]+1}/{len(steps)}] {st['tip']}{cnt}"
         cv2.putText(disp, tip, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.imshow(win, disp)
 
         k = cv2.waitKey(20) & 0xFF
         if k == ord("n") and not done:
-            if steps[idx[0]]["mode"] == "ring" and len(picks.get(steps[idx[0]]["key"], [])) < 3:
-                print("！该环至少点 3 个点。")
+            st = steps[idx[0]]
+            need = 3 if st["mode"] == "ring" else 1
+            if len(picks.get(st["key"], [])) < need:
+                print(f"！该环至少点 3 个点。" if st["mode"] == "ring"
+                      else "！至少点 1 个取色点（或按 s 跳过）。")
             else:
                 idx[0] += 1
         elif k == ord("s") and not done and steps[idx[0]]["mode"] == "color":
@@ -521,10 +521,11 @@ def calibrate():
     cfg["center"] = [int(round(cx)), int(round(cy))]
     cfg["r_inner"] = max(1, int(round(r_in)))
     cfg["r_outer"] = int(round(r_out))
-    # DEFAULT_COLORS 只含 blue/bonus/yellow，不含 outer/inner，故天然排除环点
-    colors = {k: picks.get(k, DEFAULT_COLORS[k]) for k in DEFAULT_COLORS}
-    if "bonus" not in picks and "blue" in picks:
-        colors["bonus"] = picks["blue"]        # 没单独取蓝加时条，则沿用蓝指针的蓝
+    # color 步的 picks[k] 是 HSV 采样点列表 -> 合成包围盒；没采的用默认
+    colors = {k: (build_hsv_box(picks[k]) if picks.get(k) else DEFAULT_COLORS[k])
+              for k in DEFAULT_COLORS}
+    if not picks.get("bonus") and picks.get("blue"):
+        colors["bonus"] = build_hsv_box(picks["blue"])   # 没单独取蓝加时条，沿用蓝指针的色
     cfg["colors"] = colors
     save_config(cfg)
     print(f"圆心=({cfg['center'][0]},{cfg['center'][1]})  "
