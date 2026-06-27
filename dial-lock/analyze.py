@@ -20,6 +20,12 @@ import glob
 import numpy as np
 import cv2
 
+try:    # GBK 控制台编不了部分符号会崩, 遇到就替换而非报错
+    sys.stdout.reconfigure(errors="replace")
+    sys.stderr.reconfigure(errors="replace")
+except Exception:
+    pass
+
 
 def fit_circle(pts):
     """代数最小二乘拟合圆 -> (cx, cy, R)"""

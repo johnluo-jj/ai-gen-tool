@@ -39,6 +39,11 @@ if sys.platform == "win32":
         ctypes.windll.user32.SetProcessDPIAware()
     except Exception:
         pass
+try:    # GBK 控制台编不了 ⚠/✅ 等符号会崩, 改成遇到就替换而非报错(中文照常)
+    sys.stdout.reconfigure(errors="replace")
+    sys.stderr.reconfigure(errors="replace")
+except Exception:
+    pass
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
