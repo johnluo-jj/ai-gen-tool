@@ -44,10 +44,11 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.j
 DEFAULTS = {
     "latency": 0.05,            # 总延迟(秒)：截屏+处理+系统点击；命中率主要靠它调
     "min_click_interval": 0.16, # 两次点击最小间隔(秒)，防抖
-    "arc_salience": 22,         # 显著阈值：环上像素相对底环的"亮+彩"偏离≥此值算"有东西"(抗褪色)
-    "bar_min_px": 5,            # 某角度上算"有东西"所需最少像素
-    "pointer_max_arc": 6,       # 指针/扇形分界(度)：≤此值的细段=指针，>此值=扇形(实测指针恒定4~5°，留+1°余量)
-    "bar_max_arc": 35,          # 扇形角宽上限(度)：扇形基本不超过~30°，更宽的判为非扇形(误检/反光)
+    "arc_salience": 50,         # 显著阈值：每个角度的最大"亮+彩"偏离≥此值算"有东西"(抗褪色)。对照 maxSal 调
+    "pointer_glow_arc": 18,     # 指针发光团半角宽(度)：排除指针±此角，避免把发光当扇形(真机指针带强发光)
+    "bar_min_arc": 8,           # 扇形最小角宽(度)：滤掉噪点细段
+    "bar_max_arc": 35,          # 扇形最大角宽(度)：更宽的(整圈反光/边缘环)判为非扇形丢弃
+    "max_sectors": 2,           # 至多保留的扇形数(游戏最多2个)，按强度取最强的
     "click_pos": None,          # 左键点击坐标[x,y]；null=原地点击(不移动光标，光标由你自己停好)
     "boost": {"enabled": True, "release_deg": 22.0},  # 自适应加速：离目标>该角度则按住右键
 }
@@ -162,9 +163,10 @@ def make_context(cfg):
 
 
 def detect(frame_bgr, ctx):
-    """把环带里所有"显著径向段"切出来，按角宽分类：
-      细段(≤pointer_max_arc) = 指针；宽段(pointer_max_arc~bar_max_arc) = 扇形(无死区)。
-    指针落在某扇形角度内即命中；指针并入扇形时没有独立细段(决策里按"已在扇形内"处理)。
+    """真机指针带强发光、不是细线，所以：
+      指针 = 环带里最亮的发光团(每角度最大显著度的峰值角，发光窗内加权求中心)；
+      扇形 = 排除指针发光窗后，剩余显著段里宽度在[bar_min_arc,bar_max_arc]、最强的至多 max_sectors 条。
+    用"每角度最大显著度"成廓：整圈反光/内边缘环会铺满成一条 360° 段，被宽度上限丢弃，不再碎成几十个假扇形。
     返回 (pointer, sectors)。"""
     cfg = ctx["cfg"]
     lab = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2Lab)
@@ -179,23 +181,29 @@ def detect(frame_bgr, ctx):
     if tr.any():
         Lt, At, Bt = L[tr], A[tr], Bc[tr]
         sal = np.maximum(0.0, Lt - np.median(Lt)) + np.sqrt((At - np.median(At)) ** 2 + (Bt - np.median(Bt)) ** 2)
-        sel = sal >= cfg["arc_salience"]
-        diag["trkMaxSal"] = int(sal.max())                  # 环上最大显著度(看 arc_salience 该多少)
-        diag["salPx"] = int(sel.sum())                      # 超过 arc_salience 的像素数
-        if sel.any():
-            cnt = np.bincount(ctx["angle_int"][tr][sel], minlength=360)
-            best_ptr_px = -1
-            widths = []
-            for start, length in circular_runs(cnt >= cfg["bar_min_px"]):
-                widths.append(int(length))
-                center = (start + length / 2.0) % 360.0
-                if length <= cfg["pointer_max_arc"]:                          # 细 -> 指针(取像素最多的细段)
-                    px = int(cnt[(np.arange(start, start + length) % 360)].sum())
-                    if px > best_ptr_px:
-                        best_ptr_px, pointer = px, center
-                elif length <= cfg["bar_max_arc"]:                            # 宽 -> 扇形(下界=pointer_max_arc，无死区)
-                    sectors.append({"center": center, "len": float(length)})
-            diag["runW"] = sorted(widths, reverse=True)     # 所有段的角宽(看 pointer_max_arc 该多少)
+        prof = np.zeros(360, np.float32)
+        np.maximum.at(prof, ctx["angle_int"][tr], sal)      # 每个角度的最大显著度成廓
+        diag["maxSal"] = int(prof.max())                    # 廓最大值(看 arc_salience 该设多少)
+        glow = int(cfg["pointer_glow_arc"])
+        peak = int(prof.argmax())
+        if prof[peak] >= cfg["arc_salience"]:               # 指针 = 最亮发光团的(加权)峰角
+            idxs = (peak + np.arange(-glow, glow + 1)) % 360
+            w = prof[idxs]
+            ar = np.deg2rad(idxs.astype(np.float64))
+            pointer = float(np.degrees(np.arctan2((np.sin(ar) * w).sum(), (np.cos(ar) * w).sum())) % 360.0)
+
+        active = prof >= cfg["arc_salience"]
+        if pointer is not None:                             # 把指针发光窗从扇形候选里挖掉
+            active[(peak + np.arange(-glow, glow + 1)) % 360] = False
+        cand = []
+        for start, length in circular_runs(active):
+            if cfg["bar_min_arc"] <= length <= cfg["bar_max_arc"]:
+                strength = float(prof[(start + np.arange(length)) % 360].sum())
+                cand.append({"center": (start + length / 2.0) % 360.0, "len": float(length), "str": strength})
+        cand.sort(key=lambda c: -c["str"])                  # 取最强的至多 max_sectors 条
+        sectors = [{"center": c["center"], "len": c["len"]} for c in cand[:int(cfg["max_sectors"])]]
+        diag["runW"] = sorted([int(l) for _, l in circular_runs(prof >= cfg["arc_salience"])], reverse=True)[:8]
+        diag["secW"] = [int(s["len"]) for s in sectors]     # 最终采纳的扇形角宽
     diag["ptr"] = "-" if pointer is None else int(pointer)
     diag["nSec"] = len(sectors)
     ctx["diag"] = diag
@@ -258,7 +266,7 @@ def run(cfg, debug=False):
     print("就绪。把鼠标放到游戏窗口内 -> 按 F8 开始/暂停，F9 退出。")
     print("（按 F8 若没看到 “▶ 运行中”，多半是热键没被收到：请用管理员身份运行本脚本。）")
     if debug:
-        print("debug：控制台会多打 runW/trkMaxSal/salPx/ptr/nSec，用于据实调阈值。")
+        print("debug：控制台会多打 maxSal/runW/secW/ptr/nSec，用于据实调阈值。")
 
     prev_angle, prev_t = None, None
     omega = 0.0
@@ -370,9 +378,9 @@ def draw_debug(frame, ctx, pointer, sectors, boosting, should_click):
     diag = ctx.get("diag", {})        # 诊断值叠到画面底部，方便直接截图给我看
     if diag:
         h = img.shape[0]
-        cv2.putText(img, f"runW={diag.get('runW')}", (8, h - 30),
+        cv2.putText(img, f"runW={diag.get('runW')}  secW={diag.get('secW')}", (8, h - 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(img, f"trkMaxSal={diag.get('trkMaxSal')}  salPx={diag.get('salPx')}", (8, h - 10),
+        cv2.putText(img, f"maxSal={diag.get('maxSal')}  arc_salience={cfg['arc_salience']}", (8, h - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
     return img
 
@@ -530,15 +538,12 @@ def snapshot(cfg):
         Lt, At, Bt = L[tr], A[tr], Bc[tr]
         sal = np.maximum(0.0, Lt - np.median(Lt)) + np.sqrt((At - np.median(At)) ** 2 + (Bt - np.median(Bt)) ** 2)
         sal_img[tr] = sal
+        prof = np.zeros(360, np.float32)
+        np.maximum.at(prof, ctx["angle_int"][tr], sal)      # 每角度最大显著度，和 detect 一致
         print(f"环带显著度: max={sal.max():.0f}  p99={np.percentile(sal,99):.0f}  中位={np.median(sal):.0f}")
-        print("各 arc_salience 阈值下、环带里能切出的段宽(度)：")
-        for thr in (6, 10, 14, 18, 22, 30):
-            m = sal >= thr
-            if m.any():
-                cnt = np.bincount(ctx["angle_int"][tr][m], minlength=360)
-                ws = sorted([l for _, l in circular_runs(cnt >= cfg["bar_min_px"])], reverse=True)
-            else:
-                ws = []
+        print(f"指针发光团峰角≈{int(prof.argmax())}°(maxSal={int(prof.max())})。各 arc_salience 阈值下能切出的段宽(度)：")
+        for thr in (20, 35, 50, 70, 90):
+            ws = sorted([l for _, l in circular_runs(prof >= thr)], reverse=True)
             print(f"  arc_salience={thr:>2}: 段数={len(ws):>2} 段宽={ws}")
     else:
         print("⚠ 环带像素数=0：标定的 center/r_inner/r_outer 不对(环带落到画面外或半径退化)，请重新 --calibrate。")
