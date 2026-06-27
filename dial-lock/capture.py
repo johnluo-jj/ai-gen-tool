@@ -27,6 +27,7 @@ import json
 import time
 import argparse
 import ctypes
+import subprocess
 
 import numpy as np
 import cv2
@@ -78,8 +79,9 @@ def parse_region(s):
 
 def main():
     ap = argparse.ArgumentParser(description="高速连续截图采集器")
-    ap.add_argument("--seconds", type=float, default=6.0, help="采集时长(秒)，默认6")
-    ap.add_argument("--countdown", type=int, default=3, help="开始前倒计时(秒)，默认3")
+    ap.add_argument("--seconds", type=float, default=8.0, help="采集时长(秒)，默认8")
+    ap.add_argument("--countdown", type=int, default=5, help="开始前倒计时(秒)，默认5")
+    ap.add_argument("--push", action="store_true", help="采完自动 git add/commit/push 把帧发出去")
     ap.add_argument("--select", action="store_true", help="先拖框选采集区域(区域越小帧率越高)")
     ap.add_argument("--region", type=str, default=None, help="直接指定区域 x,y,w,h(屏幕坐标)")
     ap.add_argument("--monitor", type=int, default=1, help="显示器编号(1=主屏)，--select/--region 时忽略")
@@ -121,11 +123,12 @@ def main():
     except Exception as e:
         print(f"(keyboard 不可用，无法用F9提前停，将采满时长；{e})")
 
-    # 3) 倒计时
+    # 3) 倒计时（本工具拍的是"屏幕"，所以这几秒内必须把游戏切到屏幕最前、让它在转）
+    print("【马上点一下游戏窗口，让游戏显示在屏幕最前、那局正在转！本工具拍的是屏幕画面】")
     for s in range(args.countdown, 0, -1):
-        print(f"\r  {s} 秒后开始采集，请切到游戏前台、露出圆盘 ...", end="")
+        print(f"\r  {s} 秒后开始连拍屏幕 -> 现在就切到游戏！ ...", end="")
         time.sleep(1)
-    print("\r采集中 ...                                   ")
+    print("\r采集中（保持游戏在屏幕上、别最小化）...                 ")
 
     # 4) 采集循环：只抓屏 + 去 alpha 进内存，最快
     frames = []
@@ -184,7 +187,31 @@ def main():
     }
     with open(os.path.join(out, "frames.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
-    print(f"已写 frames.json。把整个目录 {out} 发我即可。")
+    print(f"已写 frames.json -> {out}")
+
+    # 6) 可选：自动 git 提交+推送，省得手动敲 git
+    if args.push:
+        print("自动提交+推送中 ...")
+        rel = os.path.relpath(out, BASE_DIR)
+        steps = [
+            ["git", "add", out],
+            ["git", "commit", "-m", f"采集真机帧 {os.path.basename(out)}"],
+            ["git", "push"],
+        ]
+        ok = True
+        for cmd in steps:
+            r = subprocess.run(cmd, cwd=BASE_DIR, capture_output=True, text=True)
+            out_txt = (r.stdout + r.stderr).strip()
+            if out_txt:
+                print("  " + out_txt.replace("\n", "\n  "))
+            if r.returncode != 0:
+                ok = False
+                break
+        print("✅ 已推送，跟我说一声“好了”。" if ok else
+              "⚠ 自动推送失败(见上)。请手动执行：\n"
+              f"  git add {rel}\n  git commit -m 采集帧\n  git push")
+    else:
+        print(f"把整个目录发我，或下次加 --push 让我自动推送。")
 
 
 if __name__ == "__main__":
