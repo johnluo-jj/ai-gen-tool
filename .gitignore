@@ -4,5 +4,3 @@
 .idea
 __pycache__/
 *.pyc
-config.json
-_snap*.png
