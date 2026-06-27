@@ -43,17 +43,19 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.j
 
 # 颜色默认值(标定跳过时兜底；HSV，H:0-179)。指针与加时条共用 blue。
 DEFAULT_COLORS = {
-    "blue":   [[[92, 90, 120], [125, 255, 255]]],    # 蓝指针 + 蓝加时条
+    "blue":   [[[92, 90, 120], [125, 255, 255]]],    # 蓝指针
+    "bonus":  [[[92, 90, 120], [125, 255, 255]]],    # 蓝加时条(默认同蓝指针；建议标定单独取色)
     "yellow": [[[18, 110, 130], [34, 255, 255]]],    # 黄高亮条
 }
 
 DEFAULTS = {
     "latency": 0.05,            # 总延迟(秒)：截屏+处理+系统点击；命中率主要靠它调
     "min_click_interval": 0.16, # 两次点击最小间隔(秒)，防抖
-    "hit_margin_deg": 5.0,      # 命中判定角度容差
+    "fire_base_tol": 2.5,       # 瞄准弧条中心的基础角度容差(度)
+    "pointer_guard_deg": 8,     # 找蓝加时条时排除指针±该角度，避免蓝针被当成加时条
     "pointer_min_px": 8,        # 指针被认定所需最少像素
     "bar_min_px": 5,            # 某角度上被算作"条"所需最少像素
-    "bar_min_arc": 10,          # 弧条最小角宽(度)：用来滤掉"蓝针"在外圈留下的细线
+    "bar_min_arc": 4,           # 弧条最小角宽(度)：放小以便识别"逐渐变细"的条
     "pointer_band": 0.55,       # 指针检测带：内圈 [r_in, r_in+该比例*环宽]
     "bar_band": 0.60,           # 弧条检测带：外圈 末尾该比例*环宽
     "click_pos": None,          # 左键点击坐标[x,y]；null=原地点击(不移动光标，光标由你自己停好)
@@ -146,6 +148,16 @@ class Grabber:
 
 
 # ----------------------------- 检测上下文(ROI 内预计算) -----------------------------
+def resolve_colors(cfg):
+    """整理颜色：bonus 缺省时回退到 blue(老配置不必重标也能用)。"""
+    c = dict(cfg.get("colors", {}))
+    if "bonus" not in c:
+        c["bonus"] = c.get("blue", DEFAULT_COLORS["bonus"])
+    for k in DEFAULT_COLORS:
+        c.setdefault(k, DEFAULT_COLORS[k])
+    return c
+
+
 def make_context(cfg):
     cx, cy = cfg["center"]
     r_in, r_out = cfg["r_inner"], cfg["r_outer"]
@@ -172,7 +184,7 @@ def make_context(cfg):
         "angle_int": angle.astype(np.int32),
         "inner_u8": (inner.astype(np.uint8) * 255),
         "outer_u8": (outer.astype(np.uint8) * 255),
-        "colors": {k: cfg.get("colors", {}).get(k, DEFAULT_COLORS[k]) for k in DEFAULT_COLORS},
+        "colors": resolve_colors(cfg),
         "cfg": cfg,
     }
 
@@ -185,31 +197,36 @@ def color_mask(hsv, ranges, band_u8):
     return cv2.bitwise_and(mask, band_u8)
 
 
-def bars_from_mask(angle_int, mask, ctx):
+def bars_from_mask(angle_int, mask, ctx, exclude_angle=None, exclude_half=0.0):
     a = angle_int[mask > 0]
     if a.size == 0:
         return []
-    hist = np.bincount(a, minlength=360)
+    hist = np.bincount(a, minlength=360).astype(np.int64)
+    if exclude_angle is not None and exclude_half > 0:   # 抹掉指针附近，避免蓝针被当成条
+        c, h = int(round(exclude_angle)) % 360, int(exclude_half)
+        hist[(np.arange(c - h, c + h + 1) % 360)] = 0
     active = hist >= ctx["cfg"]["bar_min_px"]
     bars = []
     for start, length in circular_runs(active):
-        if ctx["cfg"]["bar_min_arc"] <= length < 350:   # 太窄=噪点/蓝针；太宽=误检整圈
+        if ctx["cfg"]["bar_min_arc"] <= length < 350:   # 太窄=噪点；太宽=误检整圈
             bars.append({"center": (start + length / 2.0) % 360.0, "len": float(length)})
     return bars
 
 
 def detect(frame_bgr, ctx):
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-    blue, yellow = ctx["colors"]["blue"], ctx["colors"]["yellow"]
+    cols = ctx["colors"]
 
     # 指针：蓝色 ∩ 内圈带
-    pmask = color_mask(hsv, blue, ctx["inner_u8"])
+    pmask = color_mask(hsv, cols["blue"], ctx["inner_u8"])
     psel = pmask > 0
     pointer = circular_mean_deg(ctx["angle"][psel]) if int(psel.sum()) >= ctx["cfg"]["pointer_min_px"] else None
 
-    # 弧条：在外圈带上找(蓝=加时条 / 黄=高亮条)；蓝针在外圈的细线会被 bar_min_arc 滤掉
-    bonus = bars_from_mask(ctx["angle_int"], color_mask(hsv, blue, ctx["outer_u8"]), ctx)
-    score = bars_from_mask(ctx["angle_int"], color_mask(hsv, yellow, ctx["outer_u8"]), ctx)
+    # 蓝加时条：外圈带，并排除指针附近(蓝针穿过外圈会留细线)
+    bonus = bars_from_mask(ctx["angle_int"], color_mask(hsv, cols["bonus"], ctx["outer_u8"]), ctx,
+                           exclude_angle=pointer, exclude_half=ctx["cfg"]["pointer_guard_deg"])
+    # 黄高亮条：外圈带(与蓝色不冲突，无需排除)
+    score = bars_from_mask(ctx["angle_int"], color_mask(hsv, cols["yellow"], ctx["outer_u8"]), ctx)
     return pointer, score, bonus
 
 
@@ -219,19 +236,22 @@ def edge_distance(pointer, bar):
     return max(0.0, abs(ang_diff(bar["center"], pointer)) - bar["len"] / 2.0)
 
 
-def choose_and_decide(pointer, omega, score, bonus, cfg):
-    """返回 (should_click, nearest_edge_dist)。蓝色加时条优先。"""
+def choose_and_decide(pointer, omega, dt, score, bonus, cfg):
+    """瞄准弧条"中心"：当(含延迟提前量的)预测点扫到中心时点击。蓝色加时条优先。
+    瞄中心而非整条，可抗"弧长逐渐变细"——边缘会缩、中心不动。
+    返回 (should_click, nearest_edge_dist)。"""
     predicted = pointer + omega * cfg["latency"]
-    margin = cfg["hit_margin_deg"]
+    fire_tol = max(cfg["fire_base_tol"], 0.6 * abs(omega) * dt)   # 至少覆盖一帧角位移，避免跨过中心
 
     should_click = False
-    for bar in bonus + score:           # 蓝条优先(放前面)，命中即触发
-        if abs(ang_diff(predicted, bar["center"])) <= bar["len"] / 2.0 + margin:
+    for bar in bonus + score:                       # 蓝条优先(放前面)
+        err = ang_diff(predicted, bar["center"])                       # 预测点相对中心
+        approaching = (omega * ang_diff(bar["center"], pointer)) > 0   # 中心在前进方向上
+        if abs(err) <= fire_tol and (approaching or abs(err) <= cfg["fire_base_tol"]):
             should_click = True
             break
 
-    all_bars = bonus + score
-    nearest = min((edge_distance(pointer, b) for b in all_bars), default=None)
+    nearest = min((edge_distance(pointer, b) for b in bonus + score), default=None)
     return should_click, nearest
 
 
@@ -283,14 +303,13 @@ def run(cfg, debug=False):
             pointer, score, bonus = detect(frame, ctx)
 
             if pointer is not None:
-                if prev_angle is not None and prev_t is not None:
-                    dt = now - prev_t
-                    if dt > 0:
-                        w = ang_diff(pointer, prev_angle) / dt
-                        omega = 0.5 * w + 0.5 * omega       # 轻度平滑，反向时也能较快跟上
+                dt = (now - prev_t) if prev_t is not None else 0.016
+                if prev_angle is not None and dt > 0:
+                    w = ang_diff(pointer, prev_angle) / dt
+                    omega = 0.5 * w + 0.5 * omega           # 轻度平滑，反向时也能较快跟上
                 prev_angle, prev_t = pointer, now
 
-                should_click, nearest = choose_and_decide(pointer, omega, score, bonus, cfg)
+                should_click, nearest = choose_and_decide(pointer, omega, dt, score, bonus, cfg)
 
                 if boost_cfg["enabled"] and nearest is not None and nearest > boost_cfg["release_deg"]:
                     set_boost(True)        # 离目标远 -> 加速
@@ -381,6 +400,7 @@ def calibrate():
         ("点 [外环边缘]", "r_out"),
         ("点 [内环边缘]", "r_in"),
         ("点 [蓝色指针] (没有可按 s 跳过)", "blue"),
+        ("点 [蓝色加时条] (没有可按 s 跳过)", "bonus"),
         ("点 [黄色高亮条] (没有可按 s 跳过)", "yellow"),
     ]
     picks = {}
@@ -456,7 +476,10 @@ def calibrate():
     cfg["center"] = [int(cx), int(cy)]
     cfg["r_inner"] = max(1, r_in)
     cfg["r_outer"] = r_out
-    cfg["colors"] = {k: picks.get(k, DEFAULT_COLORS[k]) for k in DEFAULT_COLORS}
+    colors = {k: picks.get(k, DEFAULT_COLORS[k]) for k in DEFAULT_COLORS}
+    if "bonus" not in picks and "blue" in picks:
+        colors["bonus"] = picks["blue"]        # 没单独取蓝加时条，则沿用蓝指针的蓝
+    cfg["colors"] = colors
     save_config(cfg)
     print(f"圆心=({cx},{cy}) 内径={r_in} 外径={r_out}")
     print("建议先用 --debug 跑一遍看识别准不准：python auto_unlock.py --debug")
