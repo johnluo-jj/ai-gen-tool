@@ -91,7 +91,7 @@ def main():
     ap.add_argument("--out", type=str, default=None, help="输出目录(默认 captures/run_时间戳)")
     args = ap.parse_args()
 
-    sct = mss.MSS()
+    sct = mss.mss()
 
     # 1) 确定采集区域
     if args.select:
