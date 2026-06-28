@@ -27,7 +27,7 @@
     "predict": true,
     "serve_idle_frames": 14,
     "serve_interval": 0.6,
-    "keys": { "left": "a", "right": "d", "serve": "space" },
+    "keys": { "left": "left", "right": "right", "serve": "space" },
     "max_fps": 0,
     "vel_smooth": 3
   }

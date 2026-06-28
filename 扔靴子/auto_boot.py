@@ -79,7 +79,7 @@ DEFAULT_CFG = {
         "predict": True,          # True=按速度预测落点; False=只跟球当前 X
         "serve_idle_frames": 14,  # 连续多少帧没看到动球就判定"在候发"->发球
         "serve_interval": 0.6,    # 两次发球最小间隔(秒)
-        "keys": {"left": "a", "right": "d", "serve": "space"},
+        "keys": {"left": "left", "right": "right", "serve": "space"},
         "max_fps": 0,             # 帧率上限(0=不限); 跟球快时建议不限
         "vel_smooth": 3,          # 速度用最近几帧位移平滑
     },
