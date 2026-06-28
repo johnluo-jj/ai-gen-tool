@@ -20,6 +20,8 @@
     "max_sectors": 3
   },
   "latency": 0.04,
+  "omega_max": 200.0,
+  "guard_max": 6.0,
   "min_click_interval": 0.18,
   "click_hold": 0.05,
   "conf_min": 4.0,

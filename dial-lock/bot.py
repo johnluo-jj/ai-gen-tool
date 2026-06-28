@@ -45,6 +45,8 @@ DEFAULT_CFG = {
     "r_max": 210,                  # ROI 半径(到外圈亮环外一点)
     "det": dict(DEFAULT_P),        # 检测参数(内/外层半径、阈值等, 见 detect2.DEFAULT_P)
     "latency": 0.04,               # 点击延迟提前量(秒): 总点早->调小, 总点晚->调大
+    "omega_max": 200.0,            # 角速度物理封顶(°/s): 针最快~130, 超出必是微小dt除法尖刺, 防预测/guard被带飞乱点
+    "guard_max": 6.0,              # guard(帧间余量)上限(°): 防快帧时触发窗过宽而提前点
     "min_click_interval": 0.18,    # 两次点击最小间隔(秒)
     "click_hold": 0.05,            # 左键按住时长(秒): 瞬间点击游戏常吞掉, 按住~50ms才认; 不响应可调到0.08
     "conf_min": 4.0,               # 命中判定的指针置信下限: 太高会让大量帧不可点(实跑conf常掉到8以下); 看状态行cf分布精调
@@ -206,6 +208,8 @@ def run(cfg, debug=False, record_secs=0):
             if track_ok:
                 if prev_angle is not None and 0 < dt < 0.2:
                     w = ang_diff(pointer, prev_angle) / dt
+                    om = cfg["omega_max"]
+                    w = max(-om, min(om, w))     # 物理封顶: 防微小dt造成的角速度尖刺(实测会炸到数千°/s)
                     omega = 0.6 * w + 0.4 * omega
                 prev_angle, prev_t = pointer, now
                 conf_hist.append(conf)
@@ -220,7 +224,7 @@ def run(cfg, debug=False, record_secs=0):
             should_click, nearest = False, None
             if track_ok:
                 predicted = pointer + omega * cfg["latency"]
-                guard = 0.5 * abs(omega) * dt
+                guard = min(0.5 * abs(omega) * dt, cfg["guard_max"])
                 for s in sectors:
                     if s["color"] not in ("yellow", "blue"):
                         continue
