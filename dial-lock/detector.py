@@ -17,16 +17,10 @@
             不饱和的(指针残辉/噪声)一律丢弃。
 
 detect() 是无状态纯函数；角速度/命中预测由调用方(unlock.py)做。
-
-离线自检：
-  python detector.py captures/run_YYYYmmdd_HHMMSS      # 跑检测, 出标注图 + 健康报告 -> _check/
-  python detector.py captures/botrec_YYYYmmdd_HHMMSS   # 同上(自动识别 frames.json / rec.json)
+draw() 仅供 unlock.py 的 --probe/--debug 叠加显示用。本模块是库, 不单独运行。
 """
 
-import os
 import sys
-import json
-import argparse
 
 import numpy as np
 import cv2
@@ -185,7 +179,7 @@ def detect(roi_bgr, geom, P=DEFAULT_P):
     return {"pointer": pointer, "conf": conf, "sectors": sectors, "base_in": base_in}
 
 
-# ----------------------------- 可视化 / 离线自检 -----------------------------
+# ----------------------------- 可视化(供 unlock.py 叠加显示) -----------------------------
 def draw(roi, geom, P, d, extra=""):
     ov = roi.copy()
     c = (int(geom.cxl), int(geom.cyl))
@@ -204,84 +198,3 @@ def draw(roi, geom, P, d, extra=""):
            f"conf={d['conf']:.1f} nSec={len(d['sectors'])} {extra}")
     cv2.putText(ov, tag, (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
     return ov
-
-
-def _load_run(run_dir, center_arg):
-    """读 capture(frames.json) 或 botrec(rec.json)。
-    返回 (frames_meta, 帧内圆心(cx,cy))。botrec 的帧已是 ROI, 圆心要减去 region 偏移。"""
-    p = os.path.join(run_dir, "rec.json")
-    if os.path.exists(p):                              # botrec: 帧是预裁的 ROI
-        meta = json.load(open(p, encoding="utf-8"))
-        cx, cy = meta["center"]
-        reg = meta.get("region", {})
-        return meta["frames"], (cx - reg.get("left", 0), cy - reg.get("top", 0))
-    p = os.path.join(run_dir, "frames.json")
-    if os.path.exists(p):                              # capture: 全屏帧, 圆心用绝对值
-        meta = json.load(open(p, encoding="utf-8"))
-        reg = meta.get("region", {})
-        cx, cy = (int(v) for v in center_arg.split(","))
-        return meta["frames"], (cx - reg.get("left", 0), cy - reg.get("top", 0))
-    raise SystemExit(f"{run_dir} 下没有 frames.json / rec.json")
-
-
-def main():
-    ap = argparse.ArgumentParser(description="轮盘撬锁 检测器 离线自检")
-    ap.add_argument("run_dir", help="captures/run_* 或 captures/botrec_* 目录")
-    ap.add_argument("--center", type=str, default="956,700", help="圆心 x,y(默认真机采集值)")
-    ap.add_argument("--every", type=int, default=15, help="每隔几帧存一张标注图")
-    args = ap.parse_args()
-
-    run_dir = args.run_dir
-    if not os.path.isdir(run_dir):
-        run_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), run_dir)
-    frames, (cx, cy) = _load_run(run_dir, args.center)
-    P = dict(DEFAULT_P)
-    geom = Geom(cx, cy, P)
-
-    out = os.path.join(run_dir, "_check")
-    os.makedirs(out, exist_ok=True)
-    rows = []
-    for i, f in enumerate(frames):
-        img = cv2.imread(os.path.join(run_dir, f["file"]))
-        if img is None:
-            continue
-        roi = geom.crop(img)
-        d = detect(roi, geom, P)
-        rows.append((i, f.get("t", i), d))
-        if i % args.every == 0:
-            cv2.imwrite(os.path.join(out, f"chk_{i:04d}.jpg"), draw(roi, geom, P, d),
-                        [cv2.IMWRITE_JPEG_QUALITY, 88])
-
-    # ---- 健康报告 ----
-    seen = [d for _, _, d in rows if d["pointer"] is not None]
-    # 关键健康指标: 「条落在指针角窗内」的帧数 —— 新版应≈0(旧版正是这里出错)
-    leak = 0
-    jumps = 0
-    prev = None
-    ny = nb = 0
-    for i, t, d in rows:
-        for s in d["sectors"]:
-            if s["color"] == "yellow":
-                ny += 1
-            else:
-                nb += 1
-            if d["pointer"] is not None and abs(ang_diff(s["center"], d["pointer"])) <= P["ptr_glow"]:
-                leak += 1
-        if d["pointer"] is not None:
-            if prev is not None and (t - prev[0]) < 0.1 and abs(ang_diff(d["pointer"], prev[1])) > 15:
-                jumps += 1
-            prev = (t, d["pointer"])
-
-    with open(os.path.join(out, "report.txt"), "w", encoding="utf-8") as fp:
-        def p(s):
-            print(s); fp.write(s + "\n")
-        p(f"=== detector 自检 {os.path.basename(run_dir)} (圆心={cx},{cy}) ===")
-        p(f"帧={len(rows)} 指针可见={len(seen)} ({100*len(seen)/max(1,len(rows)):.0f}%)")
-        p(f"条检出: 黄={ny} 蓝={nb} (累计跨帧)")
-        p(f"★指针角速度跳变(>15°/帧)={jumps}  <- 越少越好(0=指针识别全程平滑)")
-        p(f"★『条落在指针角窗内』泄漏={leak}  <- 必须≈0(>0 说明指针又被当成条了)")
-        p(f"标注图 chk_*.jpg / report.txt 已存 {out}")
-
-
-if __name__ == "__main__":
-    main()

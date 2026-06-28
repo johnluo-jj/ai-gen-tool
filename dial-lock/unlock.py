@@ -14,12 +14,11 @@
   • 角速度尖刺：旧版用相邻两帧角差/dt, 微小dt会炸到数千°/s。本版用 0.2s 基线测速 + 物理封顶。
   • 误点惩罚：游戏「落空会暂时无法撬锁」, 故**精度优先**——只点已确认的条, 点完给该条上冷却防重复点。
 
-检测逻辑全部复用 detector.py(已在真机帧离线验证)。
+检测逻辑全部复用 detector.py。
 
 用法(PowerShell, 建议管理员运行)：
   python unlock.py --calibrate                 # 标定圆心/半径 -> config.json(换分辨率/窗口要重标)
   python unlock.py --probe                      # 抓一帧自检几何对齐, 存 _probe.jpg, 不点击
-  python unlock.py --sim captures/run_xxxx      # 离线: 在录好的帧上跑完整命中逻辑, 出 _sim/ 报告(不点屏幕)
   python unlock.py --debug                      # 实机+显示识别画面
   python unlock.py                              # 实机正式跑; F8 开/暂停, F9 退出
 """
@@ -35,7 +34,7 @@ from collections import deque
 import numpy as np
 import cv2
 
-from detector import Geom, detect, draw, DEFAULT_P, ang_diff, circular_runs  # noqa: F401
+from detector import Geom, detect, draw, DEFAULT_P, ang_diff
 
 if sys.platform == "win32":
     try:
@@ -374,75 +373,17 @@ def probe(cfg):
         print("⚠ 画面接近全黑: 游戏多半独占全屏(mss截不到), 请切窗口化/无边框。")
 
 
-# ----------------------------- 离线仿真(在录好的帧上验证命中逻辑) -----------------------------
-def sim(cfg, run_dir):
-    from detector import _load_run
-    if not os.path.isdir(run_dir):
-        run_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), run_dir)
-    frames, (cx, cy) = _load_run(run_dir, f"{cfg['center'][0]},{cfg['center'][1]}")
-    P = make_P(cfg)
-    geom = Geom(cx, cy, P)
-    speed_est = SpeedEstimator(cfg["speed_cap"])
-    tracker = BarTracker()
-    out = os.path.join(run_dir, "_sim")
-    os.makedirs(out, exist_ok=True)
-    last_click, clicks = 0.0, []
-    trace = []                                  # (t, pointer) 全程指针轨迹, 用于事后核验命中
-    saved = {}
-    for i, f in enumerate(frames):
-        img = cv2.imread(os.path.join(run_dir, f["file"]))
-        if img is None:
-            continue
-        roi = geom.crop(img)
-        t = float(f.get("t", i / 30.0))
-        d = detect(roi, geom, P)
-        pointer = d["pointer"] if d["conf"] >= cfg["conf_min"] else None
-        trace.append((t, pointer))
-        speed = speed_est.update(pointer, t)
-        tracker.update(d["sectors"], t)
-        target = decide(pointer, speed, tracker, t, last_click, cfg)
-        if target is not None:
-            tracker.spend(target, t)
-            last_click = t
-            clicks.append({"i": i, "t": t, "ptr": pointer, "c": target["center"],
-                           "len": target["len"], "color": target["color"]})
-            ov = draw(roi, geom, P, d, extra=f"CLICK {target['color']}")
-            cv2.putText(ov, "CLICK", (6, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 220, 0), 2)
-            saved[i] = ov
-
-    # 核验: 真正的命中机会 = 指针轨迹在点击时刻±0.15s内确实进入了该条角区[心±半宽]
-    def is_real_hit(c):
-        for tt, pp in trace:
-            if pp is not None and abs(tt - c["t"]) <= 0.15 and abs(ang_diff(pp, c["c"])) <= c["len"] / 2:
-                return True
-        return False
-    good = [c for c in clicks if is_real_hit(c)]
-    for c in clicks:
-        c["ok"] = is_real_hit(c)
-        cv2.imwrite(os.path.join(out, f"click_{c['i']:04d}_{'OK' if c['ok'] else 'MISS'}.jpg"),
-                    saved[c["i"]], [cv2.IMWRITE_JPEG_QUALITY, 88])
-    print(f"=== sim {os.path.basename(run_dir)} (圆心={cx},{cy}) ===")
-    print(f"帧={len(frames)} 点击={len(clicks)} 次, 其中命中(指针确进入条)={len(good)} 误点={len(clicks)-len(good)}")
-    for c in clicks:
-        print(f"  f{c['i']:4d} t={c['t']:5.2f}: ptr={c['ptr']:6.1f} -> {c['color']:6s}@{c['c']:6.1f} "
-              f"len={c['len']:4.1f}  {'命中' if c['ok'] else '★误点(指针没进条)'}")
-    print(f"误点应为0。标注图 click_*_OK/MISS.jpg 存 {out}")
-
-
 def main():
-    ap = argparse.ArgumentParser(description="轮盘撬锁 自动 bot(全新实现)")
+    ap = argparse.ArgumentParser(description="轮盘撬锁 自动 bot")
     ap.add_argument("--calibrate", action="store_true", help="标定圆心/半径 -> config.json")
     ap.add_argument("--probe", action="store_true", help="抓一帧自检几何, 不点击")
     ap.add_argument("--debug", action="store_true", help="实机运行并显示识别画面")
-    ap.add_argument("--sim", metavar="DIR", default=None, help="离线: 在录好的帧目录上跑命中逻辑")
     args = ap.parse_args()
     cfg = load_cfg()
     if args.calibrate:
         calibrate(cfg)
     elif args.probe:
         probe(cfg)
-    elif args.sim:
-        sim(cfg, args.sim)
     else:
         run(cfg, debug=args.debug)
 
