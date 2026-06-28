@@ -1,0 +1,28 @@
+{
+  "center": [
+    956,
+    700
+  ],
+  "r_max": 210,
+  "det": {
+    "ptr_in": 105,
+    "ptr_out": 145,
+    "bar_in": 148,
+    "bar_out": 180,
+    "ptr_glow": 11,
+    "ptr_min_sal": 60,
+    "bar_min_sal": 55,
+    "flash_base": 70,
+    "bar_min_arc": 6,
+    "bar_max_arc": 60,
+    "max_sectors": 3
+  },
+  "latency": 0.04,
+  "min_click_interval": 0.18,
+  "conf_min": 8.0,
+  "boost": {
+    "enabled": true,
+    "release_deg": 30.0
+  },
+  "click_pos": null
+}
