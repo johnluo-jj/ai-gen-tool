@@ -80,6 +80,7 @@ DEFAULT_CFG = {
         "deadzone": 12,           # 挡板中心离落点 < 此值就不动, 防抖
         "predict": True,          # True=按速度预测落点; False=只跟球当前 X
         "coast_frames": 3,        # 球短暂丢检时维持上次目标继续追的帧数(防丢检停顿)
+        "min_move_speed": 80,     # 只追"在动的球"(px/s); 静止的顶部反光/候发靴子(v≈0)不追, 免得拽偏车
         "keys": {"left": "left", "right": "right"},  # 只控制左右; 发球手动按空格
         "max_fps": 0,             # 帧率上限(0=不限); 球快务必不限, 越高越不易漏接
         "vel_smooth": 3,          # 速度用最近几帧位移平滑
@@ -457,6 +458,7 @@ def run(visualize=False, record_secs=0.0):
     paddle_y = cfg["paddle_y"]
     deadzone = ctl["deadzone"]
     max_speed = cfg["ball"].get("max_speed", 6000)
+    min_move_speed = ctl.get("min_move_speed", 80)
     min_dt = (1.0 / ctl["max_fps"]) if ctl["max_fps"] > 0 else 0.0
 
     hist = deque(maxlen=max(2, ctl["vel_smooth"] + 1))  # (t, cx, cy)
@@ -520,6 +522,7 @@ def run(visualize=False, record_secs=0.0):
 
             target = None
             vx = vy = 0.0
+            moving = False
             if ball is not None:
                 cx, cy = ball[0], ball[1]
                 # 反弹(撞墙/撞砖)会让水平速度突然反号; 若仍用反弹前的速度预测落点, 落点会瞬间跳错,
@@ -531,7 +534,6 @@ def run(visualize=False, record_secs=0.0):
                     if vx_now * vx_old < 0 and abs(vx_now) >= 2 and abs(vx_old) >= 2:
                         hist.clear()
                 hist.append((now, cx, cy))
-                vx = vy = 0.0
                 if len(hist) >= 2:
                     # 最小二乘拟合速度: 比"首尾两点求差"更抗「靴子旋转→青色拖尾绕转→质心逐帧抖」的噪声。
                     ts = np.array([h[0] for h in hist], float)
@@ -542,17 +544,22 @@ def run(visualize=False, record_secs=0.0):
                     if denom > 1e-9:
                         vx = float((tc * (xs - xs.mean())).sum() / denom)
                         vy = float((tc * (ys - ys.mean())).sum() / denom)
+                moving = (vx * vx + vy * vy) ** 0.5 >= min_move_speed
+            else:
+                hist.clear()
+
+            # 只追「在动的球」: 静止的顶部反光 / 停在车上候发的靴子(速度≈0)不追, 免得把车拽偏。
+            if moving:
                 target = predict_landing(cx, cy, vx, vy, left, right, paddle_y) if ctl["predict"] else cx
                 last_target = target
                 miss = 0
             else:
-                # 球短暂丢检(钻进碎砖/某帧运动太弱): 维持上次目标继续追几帧, 别立刻停/清速度
+                # 无在动目标(没球, 或检测到但基本静止): 真球短暂丢检维持上次落点几帧, 否则不动。
                 miss += 1
                 if miss <= ctl["coast_frames"] and last_target is not None:
                     target = last_target
                 else:
                     last_target = None
-                    hist.clear()
 
             # 控车: 只控制左右键把挡板中心挪到 target(发球由你手动按空格)
             if target is not None and paddle_cx is not None:
