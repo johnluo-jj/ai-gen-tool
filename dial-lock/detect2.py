@@ -126,20 +126,23 @@ def detect(bgr, geom, P):
 
     flash = base_in >= P["flash_base"]   # 内层基底过高 = 整环发亮(闪红)
 
-    # 条: 外层, 排除指针角窗
+    # 条: 外层全廓找弧(不挖指针窗, 否则指针压上真条时会把目标删掉), 再剔除"针自身的蓝色窄弧"
     pout, _ = angle_profile(geom, sal, P["bar_in"], P["bar_out"])
     active = pout >= P["bar_min_sal"]
-    if ptr_angle is not None:
-        pk = int(round(ptr_angle))
-        active[(pk + np.arange(-P["ptr_glow"], P["ptr_glow"] + 1)) % 360] = False
     sectors = []
     for start, length in circular_runs(active):
-        if P["bar_min_arc"] <= length <= P["bar_max_arc"]:
-            ar = (start + np.arange(length)) % 360
-            strength = float(pout[ar].sum())
-            color = bar_color(bgr, geom, start, length, P)
-            sectors.append({"center": (start + length / 2.0) % 360.0, "len": float(length),
-                            "color": color, "str": strength})
+        if not (P["bar_min_arc"] <= length <= P["bar_max_arc"]):
+            continue
+        center = (start + length / 2.0) % 360.0
+        color = bar_color(bgr, geom, start, length, P)
+        # 针自身在外层的辉光: 蓝色、窄、且中心紧贴指针 -> 不是条, 跳过。
+        # (真黄条发黄不会被剔; 真蓝条多从边缘切入, 中心偏离指针>tol, 会保留; 加速模糊的针弧中心恰在指针上被剔)
+        if (ptr_angle is not None and color == "blue" and length <= P["needle_max_len"]
+                and abs(ang_diff(center, ptr_angle)) <= P["needle_center_tol"]):
+            continue
+        ar = (start + np.arange(length)) % 360
+        sectors.append({"center": center, "len": float(length),
+                        "color": color, "str": float(pout[ar].sum())})
     sectors.sort(key=lambda c: -c["str"])
     sectors = sectors[:P["max_sectors"]]
     return {"pointer": ptr_angle, "ptr_conf": ptr_conf, "sectors": sectors,
@@ -147,16 +150,22 @@ def detect(bgr, geom, P):
 
 
 def bar_color(bgr, geom, start, length, P):
-    """采样该弧在条层的像素均值, 分 黄/蓝。"""
-    ar = (start + np.arange(length)) % 360
-    mask = np.isin(geom.ang_i, ar) & (geom.rad >= P["bar_in"]) & (geom.rad <= P["bar_out"])
-    if not mask.any():
-        return "?"
-    mean = bgr[mask].mean(axis=0)   # BGR
-    b, g, r = mean
-    if r > b + 25 and g > b + 10:
+    """逐角取外层均色, 看黄/蓝占比分类。逐角(而非整体均值)是为了: 黄条被蓝针部分压住时,
+    仍能凭"有相当一段发黄"判成黄(针是蓝的, 不会让任何一段发黄)。"""
+    in_band = (geom.rad >= P["bar_in"]) & (geom.rad <= P["bar_out"])
+    yellow = blue = 0
+    for a in (start + np.arange(length)) % 360:
+        m = (geom.ang_i == a) & in_band
+        if not m.any():
+            continue
+        b, g, r = bgr[m].mean(axis=0)   # BGR
+        if r > b + 25 and g > b + 10:
+            yellow += 1
+        elif b > r + 25:
+            blue += 1
+    if yellow >= max(2, 0.3 * length):   # 有相当一段发黄 -> 黄条
         return "yellow"
-    if b > r + 25:
+    if blue >= 0.5 * length:
         return "blue"
     return "?"
 
@@ -167,6 +176,8 @@ DEFAULT_P = {
     "ptr_in": 104, "ptr_out": 118,
     "bar_in": 148, "bar_out": 180,      # 条层(黄/蓝条; 条其实从~120亮到175, 取外半段够判有无+颜色; >186是外圈装饰环排除)
     "ptr_glow": 11,                     # 指针角半窗(度)
+    "needle_max_len": 16,               # 针自身外层蓝弧最大角宽(静止~9, 加速模糊到~16); 更宽的蓝条算真条
+    "needle_center_tol": 5,             # 蓝弧中心距指针<此度才算"针自身"(真蓝条切入时中心偏离更大)
     "ptr_min_sal": 60,                  # 指针层峰阈值(峰相对环中位)
     "bar_min_sal": 55,                  # 条层显著阈值
     "flash_base": 70,                   # 指针层基底中位超过此值 = 闪红/整环亮(待测调)
