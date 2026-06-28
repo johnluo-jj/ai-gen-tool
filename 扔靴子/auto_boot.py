@@ -389,8 +389,28 @@ def snapshot():
     print("已存 _snap_raw/_snap_ball/_snap_paddle/_snap_annot.png -> 核对识别。")
 
 
+def _write_recording(cfg, rec):
+    """把 --record 缓存的帧标注后落盘 + 写 CSV, 供离线诊断(不开窗, 适配全屏客户端)。"""
+    out = os.path.join(BASE_DIR, "rec_" + time.strftime("%Y%m%d_%H%M%S"))
+    os.makedirs(out, exist_ok=True)
+    seen = sum(1 for r in rec if r[1] is not None)
+    lines = ["i,t,ball_found,ball_x,ball_y,vx,vy,paddle_cx,target,key"]
+    for i, (frame, bxy, pxy, target, vx, vy, t, key) in enumerate(rec):
+        ball = (bxy[0], bxy[1], 0, None) if bxy else None
+        paddle = (pxy[0], pxy[1], None) if pxy else None
+        imwrite_u(os.path.join(out, f"f{i:04d}.jpg"),
+                  annotate(frame, cfg, ball, paddle, target))
+        lines.append(f"{i},{t},{1 if bxy else 0},{bxy[0] if bxy else ''},"
+                     f"{bxy[1] if bxy else ''},{vx},{vy},{pxy[0] if pxy else ''},"
+                     f"{int(target) if target is not None else ''},{key or ''}")
+    with open(os.path.join(out, "frames.csv"), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    print(f"\n录制完成: {len(rec)} 帧, 识别到球 {100*seen/max(1,len(rec)):.0f}%  -> {out}")
+    print(f"把整个 {os.path.basename(out)} 目录发我(或先自己翻 fNNNN.jpg: 黄圈=球/红框=挡板/绿线=预测落点)。")
+
+
 # ----------------------------- 主循环(debug & run 共用) -----------------------------
-def run(visualize=False):
+def run(visualize=False, record_secs=0.0):
     cfg = load_cfg()
     if cfg["region"] is None or cfg["paddle_y"] is None:
         sys.exit("还没标定, 先跑: python auto_boot.py --calibrate")
@@ -444,7 +464,19 @@ def run(visualize=False):
     miss = 0
     last_log = time.perf_counter()
     frames = 0
+    seen = 0
     next_t = time.perf_counter()
+
+    rec = [] if record_secs else None       # --record: 缓存帧, 跑完落盘(不开窗)
+    rec_t0 = time.perf_counter()
+    if record_secs:
+        active["on"] = True
+        print(f"【录制 {record_secs:.0f}s】3 秒后开始, 请切回游戏、保持那局在打 (F9 可提前停) ...")
+        for s in range(3, 0, -1):
+            print(f"\r  {s}", end="")
+            time.sleep(1)
+        print("\r录制中 ...                          ")
+        rec_t0 = time.perf_counter()
 
     try:
         while not active["quit"]:
@@ -452,6 +484,9 @@ def run(visualize=False):
             if min_dt and now < next_t:
                 continue
             next_t = now + min_dt
+
+            if record_secs and (now - rec_t0) >= record_secs:
+                break
 
             if not active["on"]:
                 set_move(None)
@@ -464,12 +499,15 @@ def run(visualize=False):
             paddle = detect_paddle(frame, cfg, last_paddle_cx)
             prev_gray = gray
             frames += 1
+            if ball:
+                seen += 1
 
             paddle_cx = paddle[0] if paddle else last_paddle_cx
             if paddle:
                 last_paddle_cx = paddle[0]
 
             target = None
+            vx = vy = 0.0
             if ball is not None:
                 cx, cy = ball[0], ball[1]
                 # 反弹(撞墙/撞砖)会让水平速度突然反号; 若仍用反弹前的速度预测落点, 落点会瞬间跳错,
@@ -516,12 +554,25 @@ def run(visualize=False):
             else:
                 set_move(None)
 
+            if rec is not None:                 # --record: 缓存(去掉掩膜的轻量帧)
+                bxy = (ball[0], ball[1]) if ball else None
+                pxy = (paddle[0], paddle[1]) if paddle else (
+                    (paddle_cx, 60) if paddle_cx is not None else None)
+                rec.append((frame.copy(), bxy, pxy, target,
+                            round(vx, 1), round(vy, 1), round(now - rec_t0, 3), held["key"]))
+                if len(rec) >= 500:
+                    print("\r(录制达 500 帧上限, 提前结束)        ")
+                    break
+
             if now - last_log >= 0.5:
-                fps = frames / max(1e-6, now - last_log)
+                dtl = now - last_log
+                fps = frames / max(1e-6, dtl)
+                pct = 100 * seen / max(1, frames)
                 bs = "Y" if ball else "-"
-                print(f"\rfps={fps:5.1f} ball={bs} paddle={paddle_cx} "
+                print(f"\rfps={fps:5.1f} ballSeen={pct:3.0f}% ball={bs} paddle={paddle_cx} "
                       f"target={int(target) if target is not None else '-'} key={held['key']}   ", end="")
                 frames = 0
+                seen = 0
                 last_log = now
 
             if visualize:
@@ -533,6 +584,8 @@ def run(visualize=False):
         set_move(None)  # 收尾务必松开按住的键
         if visualize:
             cv2.destroyAllWindows()
+        if rec:
+            _write_recording(cfg, rec)
         print("\n已停止。")
 
 
@@ -540,7 +593,9 @@ def main():
     ap = argparse.ArgumentParser(description="扔靴子(打砖块) 自动辅助")
     ap.add_argument("--calibrate", action="store_true", help="标定: 框区域+点墙/挡板线")
     ap.add_argument("--snapshot", action="store_true", help="抓一帧跑识别, 存掩膜核对")
-    ap.add_argument("--debug", action="store_true", help="实时可视化(不按键)")
+    ap.add_argument("--debug", action="store_true", help="实时可视化(不按键; 全屏客户端用不了, 改用 --record)")
+    ap.add_argument("--record", nargs="?", type=float, const=8.0, default=0.0,
+                    metavar="秒", help="实机托管录制N秒(默认8): 不开窗, 存标注图+CSV供诊断(适配全屏游戏)")
     args = ap.parse_args()
     if args.calibrate:
         calibrate()
@@ -548,6 +603,8 @@ def main():
         snapshot()
     elif args.debug:
         run(visualize=True)
+    elif args.record:
+        run(record_secs=args.record)
     else:
         run(visualize=False)
 

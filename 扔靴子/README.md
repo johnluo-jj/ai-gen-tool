@@ -44,17 +44,23 @@ pip install -r requirements.txt
    - `_snap_annot.png`：黄圈=球、红框=挡板、绿线=目标，叠在原图上核对。
    - 控制台打印球中心/面积、挡板中心 X。
 
-4. **看识别准不准（实时可视化，不按键）**：
+4. **录制诊断（推荐，尤其全屏客户端）**：
    ```powershell
-   python auto_boot.py --debug
+   python auto_boot.py --record        # 默认录 8 秒; 也可 --record 12
    ```
-   黄圈=球，红框=挡板，绿竖线=预测落点，olive 横线=挡板线。控制台打 `fps= ball= paddle= target= key=`。先确认动球时黄圈稳稳跟着靴子、绿线落点合理，再正式跑。
+   倒计时 3 秒后切回游戏正常托管打几秒，**不开窗**，跑完把每帧标注图 + `frames.csv` 存到 `rec_<时间戳>/`：
+   - 每帧 `fNNNN.jpg`：黄圈=球、红框=挡板、绿竖线=预测落点、olive 横线=挡板线；
+   - `frames.csv`：逐帧 `ball_found / ball_x,y / vx,vy / paddle_cx / target / key`；
+   - 控制台尾行打印**识别率 `识别到球 NN%`**。
+   翻 jpg / 看 csv 就能判断漏接是**丢球**（黄圈常缺/乱跳）、**预测错**（绿线乱晃或不对）、还是**车没赶到**（绿线对、红框追不上）。
+
+   > `--debug` 会弹 cv2 窗口；**游戏是独占全屏客户端时切到该窗口会丢失游戏画面，用不了**——全屏一律用 `--record`。
 
 5. **正式运行**：
    ```powershell
    python auto_boot.py
    ```
-   把鼠标点进游戏窗口 → **F8** 开始/暂停（打印 `▶ 运行中`，没打印多半是热键没收到→用管理员跑），**F9** 退出。控制台打 `fps=`，**球越快越需要高 fps**（截屏区域越小帧率越高）。
+   把鼠标点进游戏窗口 → **F8** 开始/暂停（打印 `▶ 运行中`，没打印多半是热键没收到→用管理员跑），**F9** 退出。控制台打 `fps= ballSeen=NN%`（识别率）`paddle= target= key=`。
 
 ## 调参（`config.json`）
 
