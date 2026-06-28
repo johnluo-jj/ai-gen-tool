@@ -20,7 +20,7 @@
   "latency": 0.04,
   "min_click_interval": 0.18,
   "click_hold": 0.05,
-  "conf_min": 8.0,
+  "conf_min": 4.0,
   "boost": {
     "enabled": true,
     "release_deg": 30.0

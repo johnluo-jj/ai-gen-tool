@@ -47,7 +47,7 @@ DEFAULT_CFG = {
     "latency": 0.04,               # 点击延迟提前量(秒): 总点早->调小, 总点晚->调大
     "min_click_interval": 0.18,    # 两次点击最小间隔(秒)
     "click_hold": 0.05,            # 左键按住时长(秒): 瞬间点击游戏常吞掉, 按住~50ms才认; 不响应可调到0.08
-    "conf_min": 8.0,               # 指针置信下限: 低于此不点(防红闪/火花误检乱点; 实测干净帧≈8-15,毛刺5-7)
+    "conf_min": 4.0,               # 命中判定的指针置信下限: 太高会让大量帧不可点(实跑conf常掉到8以下); 看状态行cf分布精调
     "boost": {"enabled": True, "release_deg": 30.0},  # 离目标>此角->按住右键加速
     "click_pos": None,             # 左键坐标[x,y]; null=原地点(不动光标)
 }
@@ -166,7 +166,8 @@ def run(cfg, debug=False):
             (pydirectinput.mouseDown if on else pydirectinput.mouseUp)(button="right")
             boosting = on
 
-    last_log, frames, ptr_frames = time.perf_counter(), 0, 0
+    last_log, frames, ptr_frames, hit_frames = time.perf_counter(), 0, 0, 0
+    conf_hist = []
     try:
         while not state["quit"]:
             now = time.perf_counter()
@@ -183,28 +184,35 @@ def run(cfg, debug=False):
             pointer, conf, sectors = d["pointer"], d["ptr_conf"], d["sectors"]
 
             dt = (now - prev_t) if prev_t is not None else 0.016
-            good = pointer is not None and conf >= cfg["conf_min"] and not d["flash"]
-            if good:
-                ptr_frames += 1
+            # 追踪omega: 只要看得到指针且非闪红就更新(低分帧也用以保持角速度连续)
+            track_ok = pointer is not None and not d["flash"]
+            if track_ok:
                 if prev_angle is not None and 0 < dt < 0.2:
                     w = ang_diff(pointer, prev_angle) / dt
                     omega = 0.6 * w + 0.4 * omega
                 prev_angle, prev_t = pointer, now
+                conf_hist.append(conf)
             else:
                 prev_angle, prev_t, omega = None, None, 0.0
 
-            # 决策: 只点 高置信 且 预测落入"已分类黄/蓝条"的情况(防落空惩罚)
+            clickable = track_ok and conf >= cfg["conf_min"]   # 命中判定另设更严的conf门槛
+            if clickable:
+                ptr_frames += 1
+
+            # 决策: nearest(给加速判距)用所有track_ok帧算; 命中(should_click)才要求clickable
             should_click, nearest = False, None
-            if good:
+            if track_ok:
                 predicted = pointer + omega * cfg["latency"]
                 guard = 0.5 * abs(omega) * dt
                 for s in sectors:
                     if s["color"] not in ("yellow", "blue"):
                         continue
-                    if abs(ang_diff(predicted, s["center"])) <= s["len"] / 2.0 + guard:
-                        should_click = True
                     e = max(0.0, abs(ang_diff(s["center"], pointer)) - s["len"] / 2.0)
                     nearest = e if nearest is None else min(nearest, e)
+                    if clickable and abs(ang_diff(predicted, s["center"])) <= s["len"] / 2.0 + guard:
+                        should_click = True
+            if should_click:
+                hit_frames += 1
 
             bc = cfg["boost"]
             set_boost(bool(bc["enabled"] and nearest is not None and nearest > bc["release_deg"]))
@@ -221,11 +229,16 @@ def run(cfg, debug=False):
 
             if now - last_log > 1.0:
                 fps = frames / (now - last_log)
-                seen = f"{100*ptr_frames/max(1,frames):3.0f}%"
-                print(f"\rfps={fps:4.0f} ptr={'-' if pointer is None else f'{pointer:5.0f}'} conf={conf:4.1f} "
-                      f"seen={seen} w={omega:6.0f}/s nSec={len(sectors)} hit={'Y' if should_click else 'n'} "
+                seenp = 100 * ptr_frames / max(1, frames)
+                cs = sorted(conf_hist) or [0.0]
+                cf = lambda q: cs[min(len(cs) - 1, int(q * len(cs)))]
+                # cf(mn/md/mx)=conf最小/中位/最大; seen=可点帧占比; hits/s=本秒命中判定次数
+                print(f"\rfps={fps:4.0f} ptr={'-' if pointer is None else f'{pointer:5.0f}'} "
+                      f"cf(mn/md/mx)={cf(0):.0f}/{cf(.5):.0f}/{cf(.99):.0f} seen={seenp:3.0f}% "
+                      f"w={omega:6.0f}/s nSec={len(sectors)} hits/s={hit_frames} "
                       f"clicks={clicks} boost={'Y' if boosting else 'n'}   ", end="")
-                last_log, frames, ptr_frames = now, 0, 0
+                last_log, frames, ptr_frames, hit_frames = now, 0, 0, 0
+                conf_hist = []
 
             if debug:
                 cv2.imshow("bot-debug", draw_debug(roi, geom, cfg, d, omega, should_click, boosting))
