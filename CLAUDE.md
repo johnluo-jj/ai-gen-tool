@@ -21,56 +21,42 @@ Windows + PowerShell + Python（无虚拟环境约定，直接系统 Python）�
 cd dial-lock
 pip install -r requirements.txt          # 依赖: numpy opencv-python mss pydirectinput keyboard
 
-# —— 当前在用的实机 bot（detect2 检测 + bot 驱动）——
-python bot.py --probe                     # 抓一帧自检几何对齐(圆心/各层环), 存 _probe.jpg, 不点击
-python bot.py --debug                     # 显示识别画面运行
-python bot.py                             # 正式跑; F8 开/暂停, F9 退出
-python bot.py --record [SECS]             # 录制 SECS 秒(默认12)原始帧+检测决策, 录完自动 git push
+# —— 实机 bot ——
+python unlock.py --calibrate              # 标定圆心/半径 -> config.json(换分辨率/窗口要重标; 同机可跳过, 默认值即真值)
+python unlock.py --probe                  # 抓一帧自检几何对齐, 存 _probe.jpg, 不点击
+python unlock.py --debug                  # 实机运行 + 识别画面窗口
+python unlock.py                          # 正式跑; F8 开/暂停, F9 退出
 
-# —— 数据驱动的离线验证回路(改检测逻辑时用)——
-python capture.py [--seconds N] [--select] [--push]   # 高速连拍屏幕 -> captures/run_*/
-python analyze.py captures/run_YYYYmmdd_HHMMSS         # 离线分析: 拟合圆心/角速度/条 -> _analysis/
-python detect2.py captures/run_YYYYmmdd_HHMMSS         # 在采集帧上跑检测器 -> _detect2/(标注图+det.csv+report.txt)
-python detect2.py captures/run_* --profile            # 只打印径向显著度剖面, 用于定内/外层半径
+# —— 离线验证(改检测/命中逻辑后必跑)——
+python detector.py captures/run_xxxx      # 逐帧检测自检 -> _check/(标注图 + 健康报告)
+python unlock.py --sim captures/run_xxxx  # 在录好的帧上跑完整命中逻辑 -> _sim/(每次点击标注图 + 命中/误点统计)
 
-# —— 旧版一体 bot(自带检测, 见下「两代 bot」)——
-python auto_unlock.py --calibrate         # 标定圆环几何 -> config.json
-python auto_unlock.py --snapshot          # 抓一帧诊断识别
-python auto_unlock.py [--debug]           # 运行; F8 开/暂停, F9 退出
+# —— 采集新测试帧 ——
+python capture.py [--seconds N] [--select]   # 高速连拍屏幕 -> captures/run_*/(帧 + frames.json)
 ```
 
-**没有测试框架 / lint / 构建步骤。** 正确性靠「采集真机帧 → 离线在帧上验证检测 → 实机 `--probe`/`--debug` 目视核对」这条回路保证，不是单元测试。改了检测逻辑要先用 `python detect2.py <采集目录>` 在已有 `captures/run_*` 帧上回归，再上实机。
+**没有测试框架 / lint / 构建步骤。** 正确性靠「采集真机帧 → `detector.py`/`unlock.py --sim` 离线在帧上验证 → 实机 `--probe`/`--debug` 目视」这条回路保证。改了检测/命中逻辑，**先在已有 `captures/run_*` 帧上 `--sim` 回归**（看「命中/误点」数）再上实机。
 
 ## dial-lock 架构
 
-整套是从「采集真机数据 → 离线分析 → 定检测器 → 上实机」一步步重构出来的数据驱动流水线，理解时按这个数据流看：
+数据流：`capture.py` 采帧 → `detector.py` 逐帧检测 → `unlock.py` 跨帧决策(记住条)并实机点击。
 
 ```
-capture.py ──> captures/run_*/(帧+frames.json) ──┬─> analyze.py  ──> _analysis/(拟合圆心/角速度)
-                                                  └─> detect2.py  ──> _detect2/(逐帧检测验证)
-                                                          │
-                                          (detect/Geom/DEFAULT_P/ang_diff)
-                                                          │
-                                                          ▼
-                                                       bot.py ──> 实机截屏循环 + 点击/右键加速
+capture.py ─> captures/run_*/(帧+frames.json)
+                       │
+            detector.py: detect()  无状态逐帧检测(指针角 + 条)
+                       │  ┌─ detector.py <dir>            离线逐帧自检 -> _check/
+                       ▼  │
+            unlock.py: SpeedEstimator + BarTracker + decide()  有状态命中决策
+                          ├─ unlock.py --sim <dir>        离线跑完整命中逻辑 -> _sim/
+                          └─ unlock.py                    实机截屏循环 + 左键点击
 ```
 
-- **`detect2.py` 是检测的唯一真相源**。`bot.py` 顶部 `from detect2 import Geom, detect, DEFAULT_P, ang_diff` 直接复用，离线(`detect2.py` 跑采集帧)和在线(`bot.py` 跑屏幕)走完全相同的检测代码 —— 改检测只改 `detect2.py` 一处。
-- **检测核心思路(颜色无关、按半径分层)**：圆环分两层 —— 内层 `[ptr_in,ptr_out]` 只有指针、外层 `[bar_in,bar_out]` 才有黄/蓝条。指针 = 内层每角度显著度的峰（取「最亮通道」做显著度，故指针变红也认）；条 = 外层显著弧、再按均色分黄/蓝，并剔掉「针自身的窄蓝辉光」。整环变亮(落空闪红) → 内层基底高 → 低置信不点。这些经验值全在 `detect2.DEFAULT_P` 里，每个键都有注释说明为何取该范围（如指针层为何收到最内圈 `[104,118]` —— 避开会偷峰的金条）。
-- **`bot.py` 的实机策略**：用 `detect` 拿指针角+条；跨帧追踪角速度 `omega`(带物理封顶防微小 dt 除法尖刺)；`predicted = pointer + omega*latency` 预测落点，落入某条角区(加 `guard` 帧间余量)且置信达标才点；离目标远按住右键加速、临近松开保命中。左键用「按下→`click_hold`→抬起」而非瞬间点击（游戏会吞瞬间点击）。
-- **几何是真值、非每次标定**：`bot_config.json` 的 `center` 取自全屏采集的拟合圆心(956,700)；换窗口/分辨率要重采集或改配置。`bot.py --probe` 用来目视确认圆心和各层环压在真实轨道上。
-
-### 两代 bot（重要，别改错文件）
-
-| | 新版（**当前在用**） | 旧版（保留） |
-|---|---|---|
-| 入口 | `bot.py` | `auto_unlock.py` |
-| 检测 | 复用 `detect2.py`（半径分层、数据验证过） | 自带检测（单层「相对底环偏离」成廓，指针=最亮发光团） |
-| 配置 | `bot_config.json` | `config.json` |
-| 标定 | 几何取采集真值，`--probe` 核对 | `--calibrate` 手点圆环拟合 |
-| 文档 | 本文件 | `dial-lock/README.md` |
-
-近期提交都在新版（`bot.py`/`detect2.py`）。涉及检测/实机逻辑默认改新版那条线；`auto_unlock.py` 是早期一体方案，除非明确要动旧版否则不碰。
+- **`detector.py` 是检测的唯一真相源**，无状态纯函数。`unlock.py` 顶部 `from detector import Geom, detect, draw, DEFAULT_P, ang_diff` 复用，离线/在线走同一份检测 —— 改检测只改 `detector.py`。
+- **检测靠「半径形状」分指针/条，不靠颜色**（指针和蓝条都偏蓝，颜色分不开）：指针=**径向流光**，在**内半带** `[ptr_in,ptr_out]`(此处条还暗)找最亮峰；条=**切向弧**，在**外半带** `[bar_in,bar_out]` 找，**先挖掉指针那一窄角**再按宽度+饱和色(明确黄/明确蓝)筛，不饱和的(指针残辉)丢弃。参数在 `detector.DEFAULT_P`，每键带注释。半径按外轨道半径 `R` 的固定比例(`unlock.BAND_FRAC`)缩放，故 `--calibrate` 只需点轨道外缘。
+- **`unlock.py` 命中决策(关键，旧版屡错就错在这)**：实测**条是固定的、只有指针在转**。挖掉指针后那一帧条会被一起挖没——恰好在该点的瞬间瞎了。故 `BarTracker` **记住条**：指针不在条上时干净登记条的位置/颜色，指针扫进**已登记**的条就点，哪怕这帧条被指针盖住。只点 `now-last_seen<=fresh` 的「新鲜」条，避免对已消失的**幽灵条**误点（这是反复出现的 false-click 根因）。角速度用 **0.2s 基线 + 物理封顶** 估(防微小 dt 尖刺)；命中=指针(+`latency` 提前量)落入条角区；点完给该条 `spent` 冷却防重复点。
+- **精度优先**：游戏「落空(点空)会被短暂禁用」，故宁可少点不乱点；`boost`(右键加速)默认**关**（开了指针变快、窄条可能被帧间跨过而误点/漏点）。
+- **几何默认即真值**：`config.json`(或缺省) 的 `center=(956,700)`/`R=182` 取自真机采集；`--probe` 目视确认各带环压在轨道上。
 
 ## 全脚本通用约定
 
@@ -83,6 +69,6 @@ capture.py ──> captures/run_*/(帧+frames.json) ──┬─> analyze.py  �
 
 ## Git 与产物
 
-- `capture.py --push`、`bot.py --record` 会**自动 `git add/commit/push`**（把真机帧/录制发给作者离线复现）。注意这与「默认禁止写类 git 命令」的全局准则冲突：除非用户明确要采集/录制并推送，否则不要主动触发这两个开关。
-- `captures/run_*`、`botrec_*`、各 `_analysis/`/`_detect2/`/`_zoom/` 是**生成产物**（采集帧、分析图、标注图），可能体积很大；改代码时不要手动编辑这些目录的内容。
+- `capture.py --push` 会**自动 `git add/commit/push`**（把真机帧发出去）。注意这与「默认禁止写类 git 命令」的全局准则冲突：除非用户明确要采集并推送，否则不要主动用 `--push`。
+- `captures/run_*`、`captures/botrec_*` 是**采集/录制的真机帧**（测试数据/ground truth）；其下 `_check/`、`_sim/` 是离线验证生成的标注图。这些可能体积很大；改代码时不要手动编辑这些目录的内容。
 - 该游戏带排行榜，自动点击属第三方辅助、**可能违反 ToS 有封号风险**，仓库定位为个人离线学习用途。
