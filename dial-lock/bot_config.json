@@ -5,8 +5,8 @@
   ],
   "r_max": 210,
   "det": {
-    "ptr_in": 105,
-    "ptr_out": 145,
+    "ptr_in": 104,
+    "ptr_out": 118,
     "bar_in": 148,
     "bar_out": 180,
     "ptr_glow": 11,
