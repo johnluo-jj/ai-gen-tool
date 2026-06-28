@@ -11,7 +11,8 @@
 
 辅助思路(和 dial-lock 同构：截屏→视觉识别→自动操作)：
   每帧抓屏 → 找「靴子(球)」和「推车(挡板)」 → 用球的位置+速度预测它落到挡板线时的 X
-  (沿途按左右墙壁反射) → 按住 A/D 把挡板挪到落点下方 → 球停着不动(在挡板上候发)就按空格发球。
+  (沿途按左右墙壁反射) → 按住方向键把挡板挪到落点下方接住球。
+  (本辅助只控制左右接球; 发球 / 换关请自己按空格。)
 
 识别(全部用相对稳的视觉特征，见 README)：
   - 球：靴子带**青色拖尾发光**(playfield 里独一份的青色)→ 主特征；棕色靴身 + 帧间运动作兜底。
@@ -75,12 +76,11 @@ DEFAULT_CFG = {
         "band": 60,            # 在 paddle_y 下方多少 px 内找红条
     },
     "control": {
-        "deadzone": 12,            # 挡板中心离落点 < 此值就不动, 防抖
+        "deadzone": 12,           # 挡板中心离落点 < 此值就不动, 防抖
         "predict": True,          # True=按速度预测落点; False=只跟球当前 X
-        "serve_idle_frames": 14,  # 连续多少帧没看到动球就判定"在候发"->发球
-        "serve_interval": 0.6,    # 两次发球最小间隔(秒)
-        "keys": {"left": "left", "right": "right", "serve": "space"},
-        "max_fps": 0,             # 帧率上限(0=不限); 跟球快时建议不限
+        "coast_frames": 3,        # 球短暂丢检时维持上次目标继续追的帧数(防丢检停顿)
+        "keys": {"left": "left", "right": "right"},  # 只控制左右; 发球手动按空格
+        "max_fps": 0,             # 帧率上限(0=不限); 球快务必不限, 越高越不易漏接
         "vel_smooth": 3,          # 速度用最近几帧位移平滑
     },
 }
@@ -140,8 +140,8 @@ def play_box(cfg, shape):
 def detect_ball(frame, cfg, prev_gray=None, gray=None):
     """找球(靴子)。返回 (cx, cy, area, mask) 或 None。
     只认「在动的球」: 真球带青色拖尾且在移动 -> cyan∩运动。**静止的青色**(开局/过关时候发的
-    青色瞄准线、停在车上的靴子、青色装饰)被运动门挡掉 -> 返回 None, 交给发球逻辑按空格。
-    这样既不会把静止瞄准线当球(导致永不发球), 也不会锁错目标(锁在静止线上而非真球)。
+    青色瞄准线、停在车上的靴子、青色装饰)被运动门挡掉 -> 返回 None(挡板待命, 不乱动)。
+    这样不会锁错目标(锁在静止线上而非真球), 候发时挡板也不会被静止线带着跑。
     仅首帧(无前一帧、无运动信息)退回纯青色兜底。全部限制在 play_box 内。"""
     bb = cfg["ball"]
     x0, y0, x1, y1 = play_box(cfg, frame.shape)
@@ -161,7 +161,7 @@ def detect_ball(frame, cfg, prev_gray=None, gray=None):
         motion = (d > bb["motion_thresh"]).astype(np.uint8) * 255
 
     # 只取「在动的青色」: 真球在移动 -> cyan∩motion; 静止青色(候发瞄准线/装饰)无运动 -> 被挡掉。
-    # 有运动信息却找不到"在动的球" => 判定无球(返回 None), 让发球逻辑去按空格。
+    # 有运动信息却找不到"在动的球" => 判定无球(返回 None), 挡板待命。
     thr = bb["min_area"] * 255
     if motion is not None:
         mdil = cv2.dilate(motion, np.ones((7, 7), np.uint8))
@@ -440,8 +440,8 @@ def run(visualize=False):
     hist = deque(maxlen=max(2, ctl["vel_smooth"] + 1))  # (t, cx, cy)
     prev_gray = None
     last_paddle_cx = None
-    idle = 0
-    last_serve = 0.0
+    last_target = None
+    miss = 0
     last_log = time.perf_counter()
     frames = 0
     next_t = time.perf_counter()
@@ -480,16 +480,19 @@ def run(visualize=False):
                     if dt > 1e-4:
                         vx = (cx - x_0) / dt
                         vy = (cy - y_0) / dt
-                if ctl["predict"]:
-                    target = predict_landing(cx, cy, vx, vy, left, right, paddle_y)
-                else:
-                    target = cx
-                idle = 0
+                target = predict_landing(cx, cy, vx, vy, left, right, paddle_y) if ctl["predict"] else cx
+                last_target = target
+                miss = 0
             else:
-                idle += 1
-                hist.clear()
+                # 球短暂丢检(钻进碎砖/某帧运动太弱): 维持上次目标继续追几帧, 别立刻停/清速度
+                miss += 1
+                if miss <= ctl["coast_frames"] and last_target is not None:
+                    target = last_target
+                else:
+                    last_target = None
+                    hist.clear()
 
-            # 控车: 把挡板中心挪到 target
+            # 控车: 只控制左右键把挡板中心挪到 target(发球由你手动按空格)
             if target is not None and paddle_cx is not None:
                 err = target - paddle_cx
                 if err > deadzone:
@@ -500,13 +503,6 @@ def run(visualize=False):
                     set_move(None)
             else:
                 set_move(None)
-
-            # 候发: 连续多帧没动球 -> 按空格发球(限速)
-            if idle >= ctl["serve_idle_frames"] and (now - last_serve) >= ctl["serve_interval"]:
-                if press:
-                    press.press(keys["serve"])
-                last_serve = now
-                idle = 0
 
             if now - last_log >= 0.5:
                 fps = frames / max(1e-6, now - last_log)
