@@ -139,7 +139,10 @@ def play_box(cfg, shape):
 # ----------------------------- 识别 -----------------------------
 def detect_ball(frame, cfg, prev_gray=None, gray=None):
     """找球(靴子)。返回 (cx, cy, area, mask) 或 None。
-    主特征=青色拖尾; 兜底=棕色靴身 ∩ 运动。全部限制在 play_box 内。"""
+    只认「在动的球」: 真球带青色拖尾且在移动 -> cyan∩运动。**静止的青色**(开局/过关时候发的
+    青色瞄准线、停在车上的靴子、青色装饰)被运动门挡掉 -> 返回 None, 交给发球逻辑按空格。
+    这样既不会把静止瞄准线当球(导致永不发球), 也不会锁错目标(锁在静止线上而非真球)。
+    仅首帧(无前一帧、无运动信息)退回纯青色兜底。全部限制在 play_box 内。"""
     bb = cfg["ball"]
     x0, y0, x1, y1 = play_box(cfg, frame.shape)
     roi = frame[y0:y1, x0:x1]
@@ -157,13 +160,22 @@ def detect_ball(frame, cfg, prev_gray=None, gray=None):
         d = cv2.absdiff(gray[y0:y1, x0:x1], prev_gray[y0:y1, x0:x1])
         motion = (d > bb["motion_thresh"]).astype(np.uint8) * 255
 
-    # 优先青色; 没有青色再用 棕色∩运动(只运动易被碎砖/挡板干扰, 故叠棕色)
-    mask = cyan.copy()
-    if int(mask.sum()) < bb["min_area"] * 255:
-        alt = brown
-        if motion is not None:
-            alt = cv2.bitwise_and(brown, cv2.dilate(motion, np.ones((5, 5), np.uint8)))
-        mask = cv2.bitwise_or(mask, alt)
+    # 只取「在动的青色」: 真球在移动 -> cyan∩motion; 静止青色(候发瞄准线/装饰)无运动 -> 被挡掉。
+    # 有运动信息却找不到"在动的球" => 判定无球(返回 None), 让发球逻辑去按空格。
+    thr = bb["min_area"] * 255
+    if motion is not None:
+        mdil = cv2.dilate(motion, np.ones((7, 7), np.uint8))
+        cm = cv2.bitwise_and(cyan, mdil)
+        if int(cm.sum()) >= thr:
+            mask = cm                                  # 在动的青色拖尾 = 真球
+        else:
+            bm = cv2.bitwise_and(brown, mdil)
+            if int(bm.sum()) >= thr:
+                mask = bm                              # 兜底: 在动的棕色靴身
+            else:
+                return None                            # 没有在动的球 -> 候发/空场
+    else:
+        mask = cyan if int(cyan.sum()) >= thr else brown   # 仅首帧无运动信息时退回纯色
 
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
