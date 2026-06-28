@@ -134,7 +134,7 @@ def probe(cfg):
         print("⚠ 画面接近全黑: 游戏多半是独占全屏(mss截不到), 请切窗口化/无边框。")
 
 
-def run(cfg, debug=False):
+def run(cfg, debug=False, record_secs=0):
     import pydirectinput
     import keyboard
     pydirectinput.PAUSE = 0
@@ -154,7 +154,17 @@ def run(cfg, debug=False):
 
     keyboard.add_hotkey("f8", toggle)
     keyboard.add_hotkey("f9", lambda: state.update(quit=True))
-    print("就绪: 鼠标放进游戏窗口空白处 -> F8 开始/暂停, F9 退出。(F8无反应=用管理员跑)")
+
+    rec_imgs, rec_meta, rec_t0 = [], [], None
+    if record_secs:
+        print(f"【录制模式】倒计时后自动开跑并录制 {record_secs}s(边跑边点边录), 录完自动推送给作者。F9可提前停。")
+        for s in range(3, 0, -1):
+            print(f"\r  {s} 秒后开始(切到游戏、露出转盘、确保那局在转) ...", end="")
+            time.sleep(1)
+        print()
+        state["running"] = True
+    else:
+        print("就绪: 鼠标放进游戏窗口空白处 -> F8 开始/暂停, F9 退出。(F8无反应=用管理员跑)")
 
     prev_angle, prev_t, omega = None, None, 0.0
     last_click, clicks = 0.0, 0
@@ -178,7 +188,14 @@ def run(cfg, debug=False):
                 time.sleep(0.02)
                 continue
 
+            if record_secs:
+                if rec_t0 is None:
+                    rec_t0 = now
+                elif now - rec_t0 >= record_secs:
+                    break
+
             frames += 1
+            did_click = False
             roi = g.grab(region)
             d = detect(roi, geom, P)
             pointer, conf, sectors = d["pointer"], d["ptr_conf"], d["sectors"]
@@ -225,7 +242,18 @@ def run(cfg, debug=False):
                 pydirectinput.mouseDown(button="left")
                 time.sleep(cfg["click_hold"])
                 pydirectinput.mouseUp(button="left")
-                last_click, clicks = now, clicks + 1
+                last_click, clicks, did_click = now, clicks + 1, True
+
+            if record_secs:
+                rec_imgs.append(roi.copy())
+                rec_meta.append({"t": round(now - rec_t0, 4),
+                                 "ptr": None if pointer is None else round(pointer, 1),
+                                 "omega": round(omega, 1), "conf": round(conf, 2),
+                                 "flash": bool(d["flash"]),
+                                 "sectors": [{"c": round(s["center"], 1), "len": round(s["len"], 1),
+                                              "color": s["color"]} for s in sectors],
+                                 "hit": bool(should_click), "clicked": did_click,
+                                 "boost": bool(boosting)})
 
             if now - last_log > 1.0:
                 fps = frames / (now - last_log)
@@ -249,19 +277,53 @@ def run(cfg, debug=False):
         keyboard.clear_all_hotkeys()
         if debug:
             cv2.destroyAllWindows()
+        if record_secs and rec_imgs:
+            save_recording(rec_imgs, rec_meta, region, cfg)
         print("\n已退出。")
+
+
+def save_recording(imgs, meta, region, cfg):
+    """存录制帧+每帧检测决策到 captures/botrec_*, 并自动 git 推送(便于作者离线复现误点)。"""
+    import subprocess
+    base = os.path.dirname(os.path.abspath(__file__))
+    out = os.path.join(base, "captures", "botrec_" + time.strftime("%Y%m%d_%H%M%S"))
+    os.makedirs(out, exist_ok=True)
+    print(f"\n保存录制 {len(imgs)} 帧 -> {out} ...")
+    for i, (img, m) in enumerate(zip(imgs, meta)):
+        m["i"], m["file"] = i, f"f{i:04d}.jpg"
+        cv2.imwrite(os.path.join(out, m["file"]), img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    with open(os.path.join(out, "rec.json"), "w", encoding="utf-8") as f:
+        json.dump({"region": region, "center": cfg["center"], "r_max": cfg["r_max"],
+                   "det": cfg["det"], "latency": cfg["latency"], "conf_min": cfg["conf_min"],
+                   "count": len(imgs), "frames": meta}, f, ensure_ascii=False, indent=2)
+    print("已写 rec.json。自动提交+推送 ...")
+    ok = True
+    for cmd in (["git", "add", out],
+                ["git", "commit", "-m", f"bot实机录制 {os.path.basename(out)}"],
+                ["git", "push"]):
+        r = subprocess.run(cmd, cwd=base, capture_output=True, text=True)
+        txt = (r.stdout + r.stderr).strip()
+        if txt:
+            print("  " + txt.replace("\n", "\n  "))
+        if r.returncode != 0:
+            ok = False
+            break
+    print("✅ 已推送, 跟作者说“录好了”。" if ok else
+          f"⚠ 自动推送失败(见上)。请手动: git add {os.path.relpath(out, base)} ; git commit -m 录制 ; git push")
 
 
 def main():
     ap = argparse.ArgumentParser(description="轮盘撬锁 自动 bot (重构版)")
     ap.add_argument("--probe", action="store_true", help="抓一帧自检几何对齐, 不点击")
     ap.add_argument("--debug", action="store_true", help="运行时显示识别画面")
+    ap.add_argument("--record", nargs="?", type=int, const=12, default=0, metavar="SECS",
+                    help="录制模式: 自动跑并录制SECS秒(默认12)原始帧+检测决策, 录完自动推送给作者")
     args = ap.parse_args()
     cfg = load_cfg()
     if args.probe:
         probe(cfg)
     else:
-        run(cfg, debug=args.debug)
+        run(cfg, debug=args.debug, record_secs=args.record)
 
 
 if __name__ == "__main__":

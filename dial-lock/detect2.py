@@ -128,19 +128,21 @@ def detect(bgr, geom, P):
 
     # 条: 外层全廓找弧(不挖指针窗, 否则指针压上真条时会把目标删掉), 再剔除"针自身的蓝色窄弧"
     pout, _ = angle_profile(geom, sal, P["bar_in"], P["bar_out"])
+    yflag, bflag = band_color_flags(bgr, geom, P)   # 每角度黄/蓝(向量化, 一帧一次)
     active = pout >= P["bar_min_sal"]
     sectors = []
     for start, length in circular_runs(active):
         if not (P["bar_min_arc"] <= length <= P["bar_max_arc"]):
             continue
         center = (start + length / 2.0) % 360.0
-        color = bar_color(bgr, geom, start, length, P)
+        ar = (start + np.arange(length)) % 360
+        ny, nb = int(yflag[ar].sum()), int(bflag[ar].sum())
+        color = "yellow" if ny >= max(2, 0.3 * length) else "blue" if nb >= 0.5 * length else "?"
         # 针自身在外层的辉光: 蓝色、窄、且中心紧贴指针 -> 不是条, 跳过。
         # (真黄条发黄不会被剔; 真蓝条多从边缘切入, 中心偏离指针>tol, 会保留; 加速模糊的针弧中心恰在指针上被剔)
         if (ptr_angle is not None and color == "blue" and length <= P["needle_max_len"]
                 and abs(ang_diff(center, ptr_angle)) <= P["needle_center_tol"]):
             continue
-        ar = (start + np.arange(length)) % 360
         sectors.append({"center": center, "len": float(length),
                         "color": color, "str": float(pout[ar].sum())})
     sectors.sort(key=lambda c: -c["str"])
@@ -149,25 +151,20 @@ def detect(bgr, geom, P):
             "flash": flash, "base_in": base_in, "ptr_peak": peak}
 
 
-def bar_color(bgr, geom, start, length, P):
-    """逐角取外层均色, 看黄/蓝占比分类。逐角(而非整体均值)是为了: 黄条被蓝针部分压住时,
-    仍能凭"有相当一段发黄"判成黄(针是蓝的, 不会让任何一段发黄)。"""
+def band_color_flags(bgr, geom, P):
+    """每角度(0-359)在条层的均色 -> (黄, 蓝) 布尔数组。向量化(bincount), 一帧算一次。
+    逐角而非整段均值: 黄条被蓝针部分压住时, 仍能凭"有相当一段发黄"判成黄(针蓝, 不会发黄)。"""
     in_band = (geom.rad >= P["bar_in"]) & (geom.rad <= P["bar_out"])
-    yellow = blue = 0
-    for a in (start + np.arange(length)) % 360:
-        m = (geom.ang_i == a) & in_band
-        if not m.any():
-            continue
-        b, g, r = bgr[m].mean(axis=0)   # BGR
-        if r > b + 25 and g > b + 10:
-            yellow += 1
-        elif b > r + 25:
-            blue += 1
-    if yellow >= max(2, 0.3 * length):   # 有相当一段发黄 -> 黄条
-        return "yellow"
-    if blue >= 0.5 * length:
-        return "blue"
-    return "?"
+    ai = geom.ang_i[in_band]
+    px = bgr[in_band].astype(np.float32)            # (N,3) BGR
+    cnt = np.bincount(ai, minlength=360).astype(np.float32)
+    c = np.maximum(cnt, 1.0)
+    mb = np.bincount(ai, weights=px[:, 0], minlength=360) / c
+    mg = np.bincount(ai, weights=px[:, 1], minlength=360) / c
+    mr = np.bincount(ai, weights=px[:, 2], minlength=360) / c
+    yellow = (cnt > 0) & (mr > mb + 25) & (mg > mb + 10)
+    blue = (cnt > 0) & (mb > mr + 25)
+    return yellow, blue
 
 
 DEFAULT_P = {
