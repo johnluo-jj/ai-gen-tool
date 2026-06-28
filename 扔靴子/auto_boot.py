@@ -68,6 +68,7 @@ DEFAULT_CFG = {
         "brown_h": [8, 28], "brown_s": 70, "brown_v": 60,
         "min_area": 8,         # 球团最小面积(px), 滤噪点
         "motion_thresh": 18,   # 帧差阈值, 用运动兜底找球
+        "max_speed": 6000,     # 速度合理性上限(px/s): 隔帧"瞬移"超过此值判为假团(顶部反光<->底部)丢弃
     },
     "paddle": {
         # 推车顶部红横杠(红色 H 在 0 和 180 两端)
@@ -455,10 +456,12 @@ def run(visualize=False, record_secs=0.0):
     right = cfg["wall_right"] if cfg["wall_right"] is not None else region["width"]
     paddle_y = cfg["paddle_y"]
     deadzone = ctl["deadzone"]
+    max_speed = cfg["ball"].get("max_speed", 6000)
     min_dt = (1.0 / ctl["max_fps"]) if ctl["max_fps"] > 0 else 0.0
 
     hist = deque(maxlen=max(2, ctl["vel_smooth"] + 1))  # (t, cx, cy)
     prev_gray = None
+    last_good = None          # 上次"合理"的球(t,cx,cy), 用于速度合理性门
     last_paddle_cx = None
     last_target = None
     miss = 0
@@ -496,6 +499,15 @@ def run(visualize=False, record_secs=0.0):
             frame = grab(sct, region)
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             ball = detect_ball(frame, cfg, prev_gray=prev_gray, gray=gray)
+            # 速度合理性门: 反常瞬移(顶部反光团<->底部翻飞, 隔帧跳数百像素)判为假团, 丢弃 -> 走 coast
+            if ball is not None and last_good is not None:
+                gdt = now - last_good[0]
+                if gdt < 0.12:
+                    d = ((ball[0] - last_good[1]) ** 2 + (ball[1] - last_good[2]) ** 2) ** 0.5
+                    if d / max(gdt, 1e-3) > max_speed:
+                        ball = None
+            if ball is not None:
+                last_good = (now, ball[0], ball[1])
             paddle = detect_paddle(frame, cfg, last_paddle_cx)
             prev_gray = gray
             frames += 1
