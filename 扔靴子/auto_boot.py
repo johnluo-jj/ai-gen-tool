@@ -472,14 +472,26 @@ def run(visualize=False):
             target = None
             if ball is not None:
                 cx, cy = ball[0], ball[1]
+                # 反弹(撞墙/撞砖)会让水平速度突然反号; 若仍用反弹前的速度预测落点, 落点会瞬间跳错,
+                # 挡板被带着来回抖、净移动变慢 -> 靠墙那侧的边角最容易因此漏接。检测到 vx 明显反号
+                # 就清空历史, 让速度立刻按反弹后的新方向重算, 落点预测随之稳定。
+                if len(hist) >= 2:
+                    vx_now = cx - hist[-1][1]
+                    vx_old = hist[-1][1] - hist[-2][1]
+                    if vx_now * vx_old < 0 and abs(vx_now) >= 2 and abs(vx_old) >= 2:
+                        hist.clear()
                 hist.append((now, cx, cy))
                 vx = vy = 0.0
                 if len(hist) >= 2:
-                    t0, x_0, y_0 = hist[0]
-                    dt = now - t0
-                    if dt > 1e-4:
-                        vx = (cx - x_0) / dt
-                        vy = (cy - y_0) / dt
+                    # 最小二乘拟合速度: 比"首尾两点求差"更抗「靴子旋转→青色拖尾绕转→质心逐帧抖」的噪声。
+                    ts = np.array([h[0] for h in hist], float)
+                    xs = np.array([h[1] for h in hist], float)
+                    ys = np.array([h[2] for h in hist], float)
+                    tc = ts - ts.mean()
+                    denom = float((tc * tc).sum())
+                    if denom > 1e-9:
+                        vx = float((tc * (xs - xs.mean())).sum() / denom)
+                        vy = float((tc * (ys - ys.mean())).sum() / denom)
                 target = predict_landing(cx, cy, vx, vy, left, right, paddle_y) if ctl["predict"] else cx
                 last_target = target
                 miss = 0
