@@ -78,7 +78,9 @@ DEFAULT_CFG = {
     },
     "control": {
         "deadzone": 12,           # 挡板中心离落点 < 此值就不动, 防抖
-        "target_ema": 0.4,        # 目标X指数平滑系数(0~1, 越小越稳/越滞后); 跟平滑后的球X, 不做落点反射预测
+        "target_ema": 0.4,        # 目标X指数平滑系数(0~1, 越小越稳/越滞后); 跟平滑后的球X
+        "lead": 0.08,             # 提前量(秒): target = 平滑X + lead*平滑vx, 朝球去向预走一点; 0=纯跟随
+        "vx_ema": 0.25,           # 水平速度的指数平滑(0~1, 越小越重平滑): 只取低频趋势, 防旋转抖动灌进提前量
         "coast_frames": 3,        # 球短暂丢检时维持上次目标继续追的帧数(防丢检停顿)
         "min_move_speed": 80,     # 只追"在动的球"(px/s); 静止的顶部反光/候发靴子(v≈0)不追, 免得拽偏车
         "keys": {"left": "left", "right": "right"},  # 只控制左右; 发球手动按空格
@@ -439,6 +441,10 @@ def run(visualize=False, record_secs=0.0):
     max_speed = cfg["ball"].get("max_speed", 6000)
     min_move_speed = ctl.get("min_move_speed", 80)
     target_ema = ctl.get("target_ema", 0.4)
+    lead = ctl.get("lead", 0.08)
+    vx_ema = ctl.get("vx_ema", 0.25)
+    wall_l = cfg.get("wall_left")
+    wall_r = cfg.get("wall_right")
     min_dt = (1.0 / ctl["max_fps"]) if ctl["max_fps"] > 0 else 0.0
 
     hist = deque(maxlen=max(2, ctl["vel_smooth"] + 1))  # (t, cx, cy)
@@ -447,6 +453,7 @@ def run(visualize=False, record_secs=0.0):
     last_paddle_cx = None
     last_target = None
     smooth_target = None      # EMA 平滑后的目标 X
+    vx_smooth = None          # 重平滑后的水平速度(只取低频趋势, 喂提前量)
     miss = 0
     last_log = time.perf_counter()
     frames = 0
@@ -521,12 +528,17 @@ def run(visualize=False, record_secs=0.0):
             else:
                 hist.clear()
 
-            # 跟「在动的球」当前 X(经 EMA 平滑)。实测(rec 回放): 靴子旋转使质心逐帧抖 ±20px, 远大于
-            # 真实水平速度; 落点反射预测会把这点抖动放大成 196<->618 的乱摆, 挡板被甩得净移动≈0、接不住。
-            # 直接跟平滑后的球 X 最稳(抖动 6.5 vs 预测的 24), 边角也能稳定追到。静止反光/候发靴子(非moving)不追。
+            # 跟「在动的球」的 X: 平滑后的当前 X 再加一个【小提前量】(lead·平滑vx)朝球去向预走。
+            # 背景(rec 回放): 靴子旋转使质心逐帧抖 ±20px > 真实水平速度; 早期"落点反射预测"把球一路外推到
+            # 挡板线, 抖动被放大成 196<->618 乱摆、净移动≈0 接不住。现改【短外推】: lead 只预走零点几秒, 且
+            # vx 先重平滑(vx_ema)只取低频趋势 -> 抖动放大被限在 lead*抖动 内, 既补上提前量又不丢稳。
+            # 静止反光/候发靴子(非 moving)不追。
             if moving:
                 smooth_target = cx if smooth_target is None else target_ema * cx + (1 - target_ema) * smooth_target
-                target = smooth_target
+                vx_smooth = vx if vx_smooth is None else vx_ema * vx + (1 - vx_ema) * vx_smooth
+                target = smooth_target + lead * vx_smooth
+                if wall_l is not None and wall_r is not None:
+                    target = min(max(target, wall_l), wall_r)   # 提前量别把目标推出墙外
                 last_target = target
                 miss = 0
             else:
@@ -537,6 +549,7 @@ def run(visualize=False, record_secs=0.0):
                 else:
                     last_target = None
                     smooth_target = None
+                    vx_smooth = None
 
             # 控车: 只控制左右键把挡板中心挪到 target(发球由你手动按空格)
             if target is not None and paddle_cx is not None:
