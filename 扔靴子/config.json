@@ -1,12 +1,12 @@
 {
   "region": {
-    "left": 480,
+    "left": 478,
     "top": 57,
-    "width": 958,
-    "height": 963
+    "width": 961,
+    "height": 961
   },
-  "wall_left": 195,
-  "wall_right": 774,
+  "wall_left": 203,
+  "wall_right": 767,
   "paddle_y": 778,
   "ceiling": 0,
   "ball": {
@@ -23,7 +23,8 @@
     "brown_s": 70,
     "brown_v": 60,
     "min_area": 8,
-    "motion_thresh": 18
+    "motion_thresh": 18,
+    "max_speed": 6000
   },
   "paddle": {
     "red_h1": [
@@ -41,15 +42,18 @@
   },
   "control": {
     "deadzone": 12,
-    "predict": true,
-    "serve_idle_frames": 14,
-    "serve_interval": 0.6,
+    "target_ema": 0.7,
+    "coast_frames": 3,
+    "min_move_speed": 80,
     "keys": {
       "left": "left",
       "right": "right",
       "serve": "space"
     },
     "max_fps": 0,
-    "vel_smooth": 3
+    "vel_smooth": 3,
+    "predict": true,
+    "serve_idle_frames": 14,
+    "serve_interval": 0.6
   }
 }
