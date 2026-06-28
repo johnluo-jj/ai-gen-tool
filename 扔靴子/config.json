@@ -1,0 +1,34 @@
+{
+  "region": null,
+  "wall_left": null,
+  "wall_right": null,
+  "paddle_y": null,
+  "ceiling": 0,
+  "ball": {
+    "cyan_h": [80, 105],
+    "cyan_s": 70,
+    "cyan_v": 110,
+    "brown_h": [8, 28],
+    "brown_s": 70,
+    "brown_v": 60,
+    "min_area": 8,
+    "motion_thresh": 18
+  },
+  "paddle": {
+    "red_h1": [0, 8],
+    "red_h2": [168, 179],
+    "red_s": 110,
+    "red_v": 110,
+    "min_area": 40,
+    "band": 60
+  },
+  "control": {
+    "deadzone": 12,
+    "predict": true,
+    "serve_idle_frames": 14,
+    "serve_interval": 0.6,
+    "keys": { "left": "a", "right": "d", "serve": "space" },
+    "max_fps": 0,
+    "vel_smooth": 3
+  }
+}
