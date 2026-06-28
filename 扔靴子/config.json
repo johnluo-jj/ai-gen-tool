@@ -1,22 +1,39 @@
 {
-  "region": null,
-  "wall_left": null,
-  "wall_right": null,
-  "paddle_y": null,
+  "region": {
+    "left": 480,
+    "top": 57,
+    "width": 958,
+    "height": 963
+  },
+  "wall_left": 195,
+  "wall_right": 774,
+  "paddle_y": 778,
   "ceiling": 0,
   "ball": {
-    "cyan_h": [80, 105],
+    "cyan_h": [
+      80,
+      105
+    ],
     "cyan_s": 70,
     "cyan_v": 110,
-    "brown_h": [8, 28],
+    "brown_h": [
+      8,
+      28
+    ],
     "brown_s": 70,
     "brown_v": 60,
     "min_area": 8,
     "motion_thresh": 18
   },
   "paddle": {
-    "red_h1": [0, 8],
-    "red_h2": [168, 179],
+    "red_h1": [
+      0,
+      8
+    ],
+    "red_h2": [
+      168,
+      179
+    ],
     "red_s": 110,
     "red_v": 110,
     "min_area": 40,
@@ -27,7 +44,11 @@
     "predict": true,
     "serve_idle_frames": 14,
     "serve_interval": 0.6,
-    "keys": { "left": "left", "right": "right", "serve": "space" },
+    "keys": {
+      "left": "left",
+      "right": "right",
+      "serve": "space"
+    },
     "max_fps": 0,
     "vel_smooth": 3
   }
