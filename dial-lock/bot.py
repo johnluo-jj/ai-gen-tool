@@ -46,6 +46,7 @@ DEFAULT_CFG = {
     "det": dict(DEFAULT_P),        # 检测参数(内/外层半径、阈值等, 见 detect2.DEFAULT_P)
     "latency": 0.04,               # 点击延迟提前量(秒): 总点早->调小, 总点晚->调大
     "min_click_interval": 0.18,    # 两次点击最小间隔(秒)
+    "click_hold": 0.05,            # 左键按住时长(秒): 瞬间点击游戏常吞掉, 按住~50ms才认; 不响应可调到0.08
     "conf_min": 8.0,               # 指针置信下限: 低于此不点(防红闪/火花误检乱点; 实测干净帧≈8-15,毛刺5-7)
     "boost": {"enabled": True, "release_deg": 30.0},  # 离目标>此角->按住右键加速
     "click_pos": None,             # 左键坐标[x,y]; null=原地点(不动光标)
@@ -211,9 +212,11 @@ def run(cfg, debug=False):
             if should_click and (now - last_click) >= cfg["min_click_interval"]:
                 set_boost(False)
                 if cfg["click_pos"]:
-                    pydirectinput.click(cfg["click_pos"][0], cfg["click_pos"][1], button="left")
-                else:
-                    pydirectinput.click(button="left")
+                    pydirectinput.moveTo(cfg["click_pos"][0], cfg["click_pos"][1])
+                # 按下->按住->抬起: 瞬间down+up游戏会吞, 必须保持按下几十ms才被识别
+                pydirectinput.mouseDown(button="left")
+                time.sleep(cfg["click_hold"])
+                pydirectinput.mouseUp(button="left")
                 last_click, clicks = now, clicks + 1
 
             if now - last_log > 1.0:
