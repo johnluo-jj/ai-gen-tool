@@ -23,8 +23,9 @@ sys.stdout.reconfigure(errors="replace")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# 扫描码(Makecode 是 Set-1 扫描码的十进制, 不是 ASCII): V=47, L=38
-SCAN = {"V": 47, "L": 38}
+# Makecode 是 Windows 虚拟键码(VK, 字母键即大写 ASCII), 不是扫描码。
+# 依据: 雷云原始导出 `L 0.03秒.xml` 里 L=76=VK_L; 填扫描码(V=47)导入后不识别。
+VK = {"V": 86, "L": 76}
 
 # 文件名 -> (按键, 周期秒)
 TARGETS = {
@@ -145,12 +146,12 @@ def main():
     for name, (key, period) in TARGETS.items():
         path = os.path.join(HERE, name + ".xml")
         t = gen_timings(period, rng)
-        xml = build_xml(name, SCAN[key], t, old_guid(path))
+        xml = build_xml(name, VK[key], t, old_guid(path))
         with open(path, "w", encoding="utf-8", newline="") as f:
             f.write(xml)
         dws = [d for d, _ in t]
         pers = [d + g for d, g in t]
-        print(f"{name}: 键={key}(扫描码{SCAN[key]}) 平均周期 {sum(pers)/len(pers):.1f}ms "
+        print(f"{name}: 键={key}(VK{VK[key]}) 平均周期 {sum(pers)/len(pers):.1f}ms "
               f"[{min(pers)}~{max(pers)}]  按住 {min(dws)}~{max(dws)}ms")
 
 
